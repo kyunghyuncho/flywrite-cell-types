@@ -94,21 +94,33 @@ uv run python evaluate_clustering.py \
 
 Interactive exploration remains available in [`cluster_similarity_test.ipynb`](cluster_similarity_test.ipynb).
 
-### Reference scores (visual neurons, $K=729$)
+### Reference scores (visual neurons, $K=729$, seed $0$, $20$ epochs on L4)
+
+Hyperparameter grid for GNN-vSBM: $L\in\{1,2,3\}$, $d\in\{32,64\}$,
+$\mathrm{lr}\in\{0.005,0.01,0.05\}$. Full table in [`sweep_results.csv`](sweep_results.csv).
 
 | Method | Hungarian vs GT | Notes |
 | --- | ---: | --- |
-| Low-rank vSBM (fully trained) | 3139 | from saved `cluster_assignment_dict_729.npy` |
-| GNN-vSBM (L4, 20 epochs) | 2679 | multi-hop decoder; 617–706 clusters used |
-| GNN-vSBM (short CPU run) | 2385 | $\sim$90 updates only |
-| PCA + $k$-means | 1460 | `pca_cluster_assignment_dict_729.npy` |
-| Random (optimistic) | $\approx$1230 | permute GT labels |
-| Random (pessimistic) | $\approx$980 | uniform over 729 clusters |
+| **GNN-vSBM best** ($L{=}1$, $d{=}64$, $\mathrm{lr}{=}0.005$) | **3078** | best of 18 GNN configs |
+| GNN-vSBM ($L{=}1$, $d{=}32$, $\mathrm{lr}{=}0.01$) | 2990 | close second |
+| Low-rank vSBM (re-run, $20$ epochs) | 2717 | single-hop baseline on same budget |
+| Low-rank vSBM (earlier long run) | 3139 | saved historical checkpoint |
+| PCA + $k$-means (re-run) | 1440 | $d{=}32$, $10^4$ SGD steps |
+| Random (optimistic / pessimistic) | $\approx$1230 / $\approx$980 | |
 
-A full L4 run takes on the order of a few minutes ($\sim$6–7 steps/s). The GNN already
-beats PCA and random by a large margin; closing the remaining gap to the single-hop
-vSBM is a natural coursework extension (deeper GNN, longer training, edge-masking
-ablations, visual-neuron subgraphs).
+**Takeaways.** On a matched $20$-epoch budget, the best GNN decoder (**3078**) beats the
+re-run single-hop vSBM (**2717**) and PCA (**1440**). Shallower GNNs with smaller learning
+rates worked best; $\mathrm{lr}{=}0.05$ consistently underperformed. Deeper stacks ($L{=}2,3$)
+did not help under this training budget—an open question for longer runs or residual /
+normalization ablations.
+
+Reproduce the sweep:
+
+```bash
+source ~/.ortet/lightning.env
+export LIGHTNING_USERNAME=kc119 LIGHTNING_TEAMSPACE=vision-model
+uv run python launch_lightning_sweep.py --machine L4 --epochs 20 --seed 0 --stop-after
+```
 
 
 ## Environment

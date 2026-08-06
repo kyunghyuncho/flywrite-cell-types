@@ -1,0 +1,202 @@
+[
+  {
+    "name": "pca_kmeans",
+    "pred_path": "pca_sweep_assignment_dict.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 596.0,
+    "hungarian": 1440.0,
+    "ari": 0.005909887023125187,
+    "nmi": 0.22021851937330458
+  },
+  {
+    "name": "lv_vsbm",
+    "pred_path": "lv_sweep_assignment_dict.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 729.0,
+    "hungarian": 2717.0,
+    "ari": 0.052580000186683795,
+    "nmi": 0.22472918599204242
+  },
+  {
+    "name": "gnn_L1_d32_lr0.005_ent1.0",
+    "pred_path": "gnn_L1_d32_lr0.005_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 543.0,
+    "hungarian": 2949.0,
+    "ari": 0.023926860141156605,
+    "nmi": 0.21725925034644344
+  },
+  {
+    "name": "gnn_L1_d64_lr0.005_ent1.0",
+    "pred_path": "gnn_L1_d64_lr0.005_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 464.0,
+    "hungarian": 3078.0,
+    "ari": 0.02160678872907429,
+    "nmi": 0.21799861130673273
+  },
+  {
+    "name": "gnn_L1_d32_lr0.01_ent1.0",
+    "pred_path": "gnn_L1_d32_lr0.01_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 489.0,
+    "hungarian": 2990.0,
+    "ari": 0.022995219917923665,
+    "nmi": 0.21535239172638432
+  },
+  {
+    "name": "gnn_L1_d64_lr0.01_ent1.0",
+    "pred_path": "gnn_L1_d64_lr0.01_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 510.0,
+    "hungarian": 2750.0,
+    "ari": 0.01849555529977296,
+    "nmi": 0.21610133243227567
+  },
+  {
+    "name": "gnn_L1_d32_lr0.05_ent1.0",
+    "pred_path": "gnn_L1_d32_lr0.05_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 681.0,
+    "hungarian": 2201.0,
+    "ari": 0.011484246461801916,
+    "nmi": 0.2442046333152641
+  },
+  {
+    "name": "gnn_L1_d64_lr0.05_ent1.0",
+    "pred_path": "gnn_L1_d64_lr0.05_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 694.0,
+    "hungarian": 2020.0,
+    "ari": 0.011412611444390932,
+    "nmi": 0.24223264011388115
+  },
+  {
+    "name": "gnn_L2_d32_lr0.005_ent1.0",
+    "pred_path": "gnn_L2_d32_lr0.005_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 602.0,
+    "hungarian": 2753.0,
+    "ari": 0.016960138330097144,
+    "nmi": 0.21326488712416702
+  },
+  {
+    "name": "gnn_L2_d64_lr0.005_ent1.0",
+    "pred_path": "gnn_L2_d64_lr0.005_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 559.0,
+    "hungarian": 2465.0,
+    "ari": 0.012370194847166652,
+    "nmi": 0.2092848031651338
+  },
+  {
+    "name": "gnn_L2_d32_lr0.01_ent1.0",
+    "pred_path": "gnn_L2_d32_lr0.01_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 520.0,
+    "hungarian": 2606.0,
+    "ari": 0.014106553823749179,
+    "nmi": 0.20284709443010734
+  },
+  {
+    "name": "gnn_L2_d64_lr0.01_ent1.0",
+    "pred_path": "gnn_L2_d64_lr0.01_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 475.0,
+    "hungarian": 2444.0,
+    "ari": 0.008211910813640665,
+    "nmi": 0.17424917582682978
+  },
+  {
+    "name": "gnn_L2_d32_lr0.05_ent1.0",
+    "pred_path": "gnn_L2_d32_lr0.05_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 727.0,
+    "hungarian": 1844.0,
+    "ari": 0.006306025321532726,
+    "nmi": 0.23687957468381501
+  },
+  {
+    "name": "gnn_L2_d64_lr0.05_ent1.0",
+    "pred_path": "gnn_L2_d64_lr0.05_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 725.0,
+    "hungarian": 1795.0,
+    "ari": 0.006423532763749357,
+    "nmi": 0.23088592387264514
+  },
+  {
+    "name": "gnn_L3_d32_lr0.005_ent1.0",
+    "pred_path": "gnn_L3_d32_lr0.005_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 541.0,
+    "hungarian": 2745.0,
+    "ari": 0.016867364144103215,
+    "nmi": 0.21644020190978602
+  },
+  {
+    "name": "gnn_L3_d64_lr0.005_ent1.0",
+    "pred_path": "gnn_L3_d64_lr0.005_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 529.0,
+    "hungarian": 2313.0,
+    "ari": 0.009538432439055425,
+    "nmi": 0.19386667881133893
+  },
+  {
+    "name": "gnn_L3_d32_lr0.01_ent1.0",
+    "pred_path": "gnn_L3_d32_lr0.01_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 497.0,
+    "hungarian": 2534.0,
+    "ari": 0.012241170522752916,
+    "nmi": 0.18334410554741584
+  },
+  {
+    "name": "gnn_L3_d64_lr0.01_ent1.0",
+    "pred_path": "gnn_L3_d64_lr0.01_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 472.0,
+    "hungarian": 2501.0,
+    "ari": 0.014934057197300586,
+    "nmi": 0.1732579789857475
+  },
+  {
+    "name": "gnn_L3_d32_lr0.05_ent1.0",
+    "pred_path": "gnn_L3_d32_lr0.05_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 729.0,
+    "hungarian": 1786.0,
+    "ari": 0.006819126283186614,
+    "nmi": 0.22266142926788743
+  },
+  {
+    "name": "gnn_L3_d64_lr0.05_ent1.0",
+    "pred_path": "gnn_L3_d64_lr0.05_ent1.0_assignment_dict_729.npy",
+    "n_shared": 46479.0,
+    "n_gt_clusters": 729.0,
+    "n_pred_clusters": 726.0,
+    "hungarian": 1877.0,
+    "ari": 0.007707895771112072,
+    "nmi": 0.2223628021251601
+  }
+]

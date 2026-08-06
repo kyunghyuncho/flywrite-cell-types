@@ -1,0 +1,10 @@
+{
+  "name": "gnn_L1_d64_lr0.005_ent1.0",
+  "pred_path": "gnn_L1_d64_lr0.005_ent1.0_assignment_dict_729.npy",
+  "n_shared": 46479.0,
+  "n_gt_clusters": 729.0,
+  "n_pred_clusters": 464.0,
+  "hungarian": 3078.0,
+  "ari": 0.02160678872907429,
+  "nmi": 0.21799861130673273
+}

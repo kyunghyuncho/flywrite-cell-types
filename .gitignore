@@ -7,6 +7,7 @@ __pycache__/
 *.npy
 *.pt
 *.csv
+!sweep_results.csv
 *.csv.gz
 *.png
 root_id_to_index_mapping.json
