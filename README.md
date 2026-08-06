@@ -92,7 +92,16 @@ uv run python evaluate_clustering.py \
          pca_cluster_assignment_dict_729.npy
 ```
 
-Interactive exploration remains available in [`cluster_similarity_test.ipynb`](cluster_similarity_test.ipynb).
+Interactive inspection of the L4 sweep (leaderboard, hyperparameter heatmaps,
+confusion matrices, pairwise agreement) is in
+[`inspect_sweep_results.ipynb`](inspect_sweep_results.ipynb):
+
+```bash
+uv run jupyter notebook inspect_sweep_results.ipynb
+```
+
+An earlier ad-hoc comparison notebook remains at
+[`cluster_similarity_test.ipynb`](cluster_similarity_test.ipynb).
 
 ### Reference scores (visual neurons, $K=729$, seed $0$, $20$ epochs on L4)
 

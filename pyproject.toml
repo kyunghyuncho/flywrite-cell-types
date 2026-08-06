@@ -5,10 +5,12 @@ description = "Variational stochastic block models for FlyWire neuron clustering
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "matplotlib",
     "numpy",
     "pandas",
     "scikit-learn",
     "scipy",
+    "seaborn",
     "torch",
     "tqdm",
 ]
