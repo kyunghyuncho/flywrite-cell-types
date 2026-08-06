@@ -24,4 +24,7 @@ heldout_rows.npz
 *.png
 root_id_to_index_mapping.json
 uv.lock
+lightning_unsup_sweep.log
+*.log
+
 .ipynb_checkpoints/
