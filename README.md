@@ -99,14 +99,17 @@ Interactive exploration remains available in [`cluster_similarity_test.ipynb`](c
 | Method | Hungarian vs GT | Notes |
 | --- | ---: | --- |
 | Low-rank vSBM (fully trained) | 3139 | from saved `cluster_assignment_dict_729.npy` |
-| GNN-vSBM (short run, $\sim$90 updates) | 2385 | already above PCA / random; improves with longer training |
+| GNN-vSBM (L4, 20 epochs) | 2679 | multi-hop decoder; 617–706 clusters used |
+| GNN-vSBM (short CPU run) | 2385 | $\sim$90 updates only |
 | PCA + $k$-means | 1460 | `pca_cluster_assignment_dict_729.npy` |
 | Random (optimistic) | $\approx$1230 | permute GT labels |
 | Random (pessimistic) | $\approx$980 | uniform over 729 clusters |
 
-The GNN decoder is the intended direction for capturing multi-hop type-level
-connectivity; longer training and hyperparameter sweeps are recommended for coursework
-extensions.
+A full L4 run takes on the order of a few minutes ($\sim$6–7 steps/s). The GNN already
+beats PCA and random by a large margin; closing the remaining gap to the single-hop
+vSBM is a natural coursework extension (deeper GNN, longer training, edge-masking
+ablations, visual-neuron subgraphs).
+
 
 ## Environment
 
@@ -135,10 +138,11 @@ uv pip install lightning-sdk
 uv run python launch_lightning_train.py --machine L4 --epochs 20 --stop-after
 ```
 
-**Note.** Free-tier Lightning accounts can start CPU Studios, but GPU machines require a
-verified payment method. After billing is enabled, the same command boots an L4, uploads
-code/data if needed, trains with `--device cuda`, evaluates, downloads artifacts, and
-optionally stops the Studio.
+**Note.** GPU machines require a verified payment method on Lightning. After billing is
+enabled, the launcher boots an L4, optionally uploads code/data, trains with
+`--device cuda`, evaluates, downloads artifacts, and can stop the Studio with
+`--stop-after`. Use `--skip-upload` when the Studio already has the files.
+
 
 ## License
 
