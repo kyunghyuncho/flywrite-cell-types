@@ -40,6 +40,8 @@ CODE_FILES = [
     "requirements.txt",
     "README.md",
     "launch_lightning_sweep.py",
+    "remote_start_unsup_sweep.sh",
+    "remote_status_unsup_sweep.sh",
 ]
 
 DATA_FILES = [
@@ -78,25 +80,6 @@ def resolve_machine(name: str) -> Machine:
 def studio_run(studio: Studio, cmd: str) -> tuple[str, int]:
     out, code = studio.run_with_exit_code(cmd)
     return out or "", int(code)
-
-
-def find_work_cmd() -> str:
-    return r"""
-python - <<'PY'
-from pathlib import Path
-roots = [Path('.').resolve(), Path.home(), Path('/teamspace/studios/this_studio')]
-for root in roots:
-    for p in root.rglob('run_experiments.py'):
-        try:
-            txt = p.read_text(errors='ignore')
-        except Exception:
-            continue
-        if 'Unsupervised HP search' in txt:
-            print(p.parent)
-            raise SystemExit
-raise SystemExit('new run_experiments.py not found')
-PY
-""".strip()
 
 
 def download_artifacts(studio: Studio) -> None:
@@ -206,30 +189,12 @@ def main() -> None:
 
         # Kill any previous detached sweep, then start a fresh nohup job.
         print(f"Detaching unsupervised protocol:\n  {sweep_args}")
-        start_cmd = f"""
-set -euo pipefail
-WORK=$({find_work_cmd()})
-echo "Using WORK=$WORK"
-cd "$WORK"
-# Stop prior detached sweep if still running.
-if [ -f {REMOTE_PID} ]; then
-  old=$(cat {REMOTE_PID} || true)
-  if [ -n "${{old}}" ] && kill -0 "${{old}}" 2>/dev/null; then
-    echo "Killing prior sweep pid ${{old}}"
-    kill "${{old}}" || true
-    sleep 2
-    kill -9 "${{old}}" 2>/dev/null || true
-  fi
-fi
-pkill -f 'python run_experiments.py' 2>/dev/null || true
-rm -f {REMOTE_DONE} {REMOTE_LOG}
-nohup bash -lc 'python -u run_experiments.py {sweep_args}; echo $? > {REMOTE_DONE}' \
-  > {REMOTE_LOG} 2>&1 &
-echo $! > {REMOTE_PID}
-echo "Started pid=$(cat {REMOTE_PID})"
-sleep 2
-tail -n 40 {REMOTE_LOG} || true
-"""
+        start_cmd = (
+            "chmod +x /teamspace/studios/this_studio/remote_start_unsup_sweep.sh "
+            "/teamspace/studios/this_studio/remote_status_unsup_sweep.sh && "
+            f"SWEEP_ARGS={sweep_args!r} "
+            "bash /teamspace/studios/this_studio/remote_start_unsup_sweep.sh"
+        )
         out, code = studio_run(studio, start_cmd)
         print(out)
         if code != 0:
@@ -243,17 +208,9 @@ tail -n 40 {REMOTE_LOG} || true
         t0 = time.time()
         last_tail = ""
         while True:
-            status_cmd = f"""
-cd /teamspace/studios/this_studio || exit 1
-pid=$(cat {REMOTE_PID} 2>/dev/null || true)
-alive=0
-if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then alive=1; fi
-done=0
-[ -f {REMOTE_DONE} ] && done=1
-echo "STATUS alive=$alive done=$done pid=$pid"
-tail -n 25 {REMOTE_LOG} 2>/dev/null || true
-"""
-            out, _ = studio_run(studio, status_cmd)
+            out, _ = studio_run(
+                studio, "bash /teamspace/studios/this_studio/remote_status_unsup_sweep.sh"
+            )
             if out.strip() and out.strip() != last_tail:
                 print(out)
                 last_tail = out.strip()
