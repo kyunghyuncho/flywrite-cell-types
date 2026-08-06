@@ -1,5 +1,8 @@
 """Launch unsupervised HP search + multi-seed finals on Lightning AI (L4/T4).
 
+Detaches the long sweep on the Studio (nohup + log file) and polls progress
+locally, so the client is not blocked on a multi-hour ``run_with_exit_code``.
+
 Example:
 
     source ~/.ortet/lightning.env
@@ -19,6 +22,9 @@ from pathlib import Path
 from lightning_sdk import Machine, Studio
 
 REPO_ROOT = Path(__file__).resolve().parent
+REMOTE_LOG = "unsup_sweep.log"
+REMOTE_DONE = "unsup_sweep.done"
+REMOTE_PID = "unsup_sweep.pid"
 
 CODE_FILES = [
     "gnn_vsbm.py",
@@ -42,6 +48,19 @@ DATA_FILES = [
     "root_id_type_dict.pkl",
 ]
 
+SUMMARY_ARTIFACTS = [
+    "heldout_pairs.npz",
+    "heldout_rows.npz",
+    "hp_results.json",
+    "hp_results.csv",
+    "hp_best.json",
+    "final_results.json",
+    "final_results.csv",
+    "final_summary.json",
+    "final_summary.csv",
+    REMOTE_LOG,
+]
+
 
 def require_auth() -> None:
     if not os.environ.get("LIGHTNING_USER_ID") or not os.environ.get("LIGHTNING_API_KEY"):
@@ -54,6 +73,63 @@ def resolve_machine(name: str) -> Machine:
     if not hasattr(Machine, key):
         raise SystemExit(f"Unknown machine {name!r}")
     return getattr(Machine, key)
+
+
+def studio_run(studio: Studio, cmd: str) -> tuple[str, int]:
+    out, code = studio.run_with_exit_code(cmd)
+    return out or "", int(code)
+
+
+def find_work_cmd() -> str:
+    return r"""
+python - <<'PY'
+from pathlib import Path
+roots = [Path('.').resolve(), Path.home(), Path('/teamspace/studios/this_studio')]
+for root in roots:
+    for p in root.rglob('run_experiments.py'):
+        try:
+            txt = p.read_text(errors='ignore')
+        except Exception:
+            continue
+        if 'Unsupervised HP search' in txt:
+            print(p.parent)
+            raise SystemExit
+raise SystemExit('new run_experiments.py not found')
+PY
+""".strip()
+
+
+def download_artifacts(studio: Studio) -> None:
+    print("Downloading summary artifacts...")
+    for name in SUMMARY_ARTIFACTS:
+        try:
+            studio.download_file(name, str(REPO_ROOT / name))
+            print(f"  <- {name}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ! {name}: {exc}")
+
+    out, _ = studio_run(
+        studio,
+        "cd /teamspace/studios/this_studio && "
+        "python -c \"import glob; print('\\\\n'.join(sorted("
+        "glob.glob('final_*_assignment_dict*.npy')+"
+        "glob.glob('hp_*_assignment_dict*.npy')+"
+        "glob.glob('*_metrics.json'))))\"",
+    )
+    for line in out.splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        try:
+            studio.download_file(name, str(REPO_ROOT / name))
+            print(f"  <- {name}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ! {name}: {exc}")
+
+    summary_path = REPO_ROOT / "final_summary.json"
+    if summary_path.exists():
+        print("Final uncertainty summary:")
+        print(json.dumps(json.loads(summary_path.read_text()), indent=2))
 
 
 def main() -> None:
@@ -76,6 +152,12 @@ def main() -> None:
     parser.add_argument("--skip-upload", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--stop-after", action="store_true")
+    parser.add_argument("--poll-seconds", type=int, default=120)
+    parser.add_argument(
+        "--detach-only",
+        action="store_true",
+        help="Start the remote job and exit without polling/downloading.",
+    )
     args = parser.parse_args()
     require_auth()
 
@@ -103,9 +185,7 @@ def main() -> None:
                 print(f"  -> {name}")
                 studio.upload_file(str(local), name)
 
-        out, code = studio.run_with_exit_code(
-            "pip install -q torch scipy numpy scikit-learn tqdm pandas"
-        )
+        out, code = studio_run(studio, "pip install -q torch scipy numpy scikit-learn tqdm pandas")
         if code != 0:
             raise RuntimeError(f"pip failed: {out}")
 
@@ -124,81 +204,81 @@ def main() -> None:
         if args.skip_existing:
             sweep_args += " --skip-existing"
 
-        # Uploads land in the Studio filesystem, but the shell cwd is not always that
-        # directory. Resolve the directory that contains the *new* orchestrator.
-        cmd = f"""
+        # Kill any previous detached sweep, then start a fresh nohup job.
+        print(f"Detaching unsupervised protocol:\n  {sweep_args}")
+        start_cmd = f"""
 set -euo pipefail
-WORK=$(python - <<'PY'
-from pathlib import Path
-roots = [Path('.').resolve(), Path.home(), Path('/teamspace/studios/this_studio')]
-for root in roots:
-    for p in root.rglob('run_experiments.py'):
-        try:
-            txt = p.read_text(errors='ignore')
-        except Exception:
-            continue
-        if 'Unsupervised HP search' in txt:
-            print(p.parent)
-            raise SystemExit
-raise SystemExit('new run_experiments.py not found')
-PY
-)
+WORK=$({find_work_cmd()})
 echo "Using WORK=$WORK"
 cd "$WORK"
-python -c "import run_experiments; print(run_experiments.__doc__.splitlines()[0])"
-python run_experiments.py {sweep_args}
+# Stop prior detached sweep if still running.
+if [ -f {REMOTE_PID} ]; then
+  old=$(cat {REMOTE_PID} || true)
+  if [ -n "${{old}}" ] && kill -0 "${{old}}" 2>/dev/null; then
+    echo "Killing prior sweep pid ${{old}}"
+    kill "${{old}}" || true
+    sleep 2
+    kill -9 "${{old}}" 2>/dev/null || true
+  fi
+fi
+pkill -f 'python run_experiments.py' 2>/dev/null || true
+rm -f {REMOTE_DONE} {REMOTE_LOG}
+nohup bash -lc 'python -u run_experiments.py {sweep_args}; echo $? > {REMOTE_DONE}' \
+  > {REMOTE_LOG} 2>&1 &
+echo $! > {REMOTE_PID}
+echo "Started pid=$(cat {REMOTE_PID})"
+sleep 2
+tail -n 40 {REMOTE_LOG} || true
 """
-        print(f"Running unsupervised protocol:\n  {sweep_args}")
-        t0 = time.time()
-        out, code = studio.run_with_exit_code(cmd)
+        out, code = studio_run(studio, start_cmd)
         print(out)
         if code != 0:
-            raise RuntimeError(f"Sweep failed with exit code {code}")
-        print(f"Finished in {time.time() - t0:.1f}s")
+            raise RuntimeError(f"Failed to detach sweep: {code}")
 
-        artifacts = [
-            "heldout_pairs.npz",
-            "heldout_rows.npz",
-            "hp_results.json",
-            "hp_results.csv",
-            "hp_best.json",
-            "final_results.json",
-            "final_results.csv",
-            "final_summary.json",
-            "final_summary.csv",
-        ]
-        print("Downloading summary artifacts...")
-        for name in artifacts:
-            try:
-                studio.download_file(name, str(REPO_ROOT / name))
-                print(f"  <- {name}")
-            except Exception as exc:  # noqa: BLE001
-                print(f"  ! {name}: {exc}")
+        if args.detach_only:
+            print("Detached only; not polling. Tail remote log later with the Studio shell.")
+            return
 
-        # Prefer final multi-seed assignment dicts; fall back to HP ones.
-        list_cmd = (
-            'python -c "import glob,json; '
-            "print('\\\\n'.join(sorted(glob.glob('final_*_assignment_dict*.npy') "
-            "+ glob.glob('hp_*_assignment_dict*.npy') "
-            "+ glob.glob('*_metrics.json'))))\""
+        print(f"Polling every {args.poll_seconds}s ...")
+        t0 = time.time()
+        last_tail = ""
+        while True:
+            status_cmd = f"""
+cd /teamspace/studios/this_studio || exit 1
+pid=$(cat {REMOTE_PID} 2>/dev/null || true)
+alive=0
+if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then alive=1; fi
+done=0
+[ -f {REMOTE_DONE} ] && done=1
+echo "STATUS alive=$alive done=$done pid=$pid"
+tail -n 25 {REMOTE_LOG} 2>/dev/null || true
+"""
+            out, _ = studio_run(studio, status_cmd)
+            if out.strip() and out.strip() != last_tail:
+                print(out)
+                last_tail = out.strip()
+            else:
+                print(f"... still running ({time.time() - t0:.0f}s)")
+
+            alive = "alive=1" in out
+            done = "done=1" in out
+            if done or not alive:
+                break
+            time.sleep(args.poll_seconds)
+
+        # Read exit code written by the wrapper.
+        done_out, _ = studio_run(
+            studio,
+            f"cd /teamspace/studios/this_studio && cat {REMOTE_DONE} 2>/dev/null || echo missing",
         )
-        out, _ = studio.run_with_exit_code(list_cmd)
-        for line in (out or "").splitlines():
-            name = line.strip()
-            if not name:
-                continue
-            try:
-                studio.download_file(name, str(REPO_ROOT / name))
-                print(f"  <- {name}")
-            except Exception as exc:  # noqa: BLE001
-                print(f"  ! {name}: {exc}")
+        exit_code = done_out.strip().splitlines()[-1] if done_out.strip() else "missing"
+        print(f"Remote sweep finished with exit code {exit_code} after {time.time() - t0:.1f}s")
+        if exit_code not in {"0"}:
+            raise RuntimeError(f"Sweep failed with exit code {exit_code}")
 
-        summary_path = REPO_ROOT / "final_summary.json"
-        if summary_path.exists():
-            print("Final uncertainty summary:")
-            print(json.dumps(json.loads(summary_path.read_text()), indent=2))
+        download_artifacts(studio)
     finally:
-        if args.stop_after:
+        if args.stop_after and not args.detach_only:
             print("Stopping Studio...")
             studio.stop()
 
