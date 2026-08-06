@@ -196,7 +196,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     "--lr",
                     str(hp["lr"]),
                     "--max-iter",
-                    str(args.pca_max_iter),
+                    str(args.final_pca_max_iter),
                     "--seed",
                     str(seed),
                     "--device",
@@ -218,7 +218,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     "--lr",
                     str(hp["lr"]),
                     "--epochs",
-                    str(args.epochs),
+                    str(args.final_epochs),
                     "--minibatch",
                     str(args.minibatch),
                     "--seed",
@@ -244,7 +244,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     "--lr",
                     str(hp["lr"]),
                     "--epochs",
-                    str(args.epochs),
+                    str(args.final_epochs),
                     "--minibatch",
                     str(args.minibatch),
                     "--seed",
@@ -289,23 +289,35 @@ def main() -> None:
     p.add_argument("--gt", default="root_id_type_dict.pkl")
     p.add_argument("--device", default="cuda")
     p.add_argument("--k", type=int, default=729)
-    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--epochs", type=int, default=5, help="HP-search epoch budget for LV/GNN")
+    p.add_argument(
+        "--final-epochs",
+        type=int,
+        default=20,
+        help="Full epoch budget for multi-seed final LV/GNN runs",
+    )
     p.add_argument("--minibatch", type=int, default=2048)
-    p.add_argument("--pca-max-iter", type=int, default=10_000)
+    p.add_argument("--pca-max-iter", type=int, default=2_000, help="HP-search PCA SGD steps")
+    p.add_argument(
+        "--final-pca-max-iter",
+        type=int,
+        default=10_000,
+        help="Full PCA SGD steps for multi-seed finals",
+    )
     p.add_argument("--split-seed", type=int, default=0)
     p.add_argument("--heldout-pairs", default="heldout_pairs.npz")
     p.add_argument("--heldout-rows", default="heldout_rows.npz")
     p.add_argument("--n-heldout-pos", type=int, default=50_000)
     p.add_argument("--n-heldout-neg", type=int, default=50_000)
     p.add_argument("--row-holdout", type=float, default=0.1)
-    p.add_argument("--pca-dims", type=int, nargs="+", default=[16, 32, 64])
-    p.add_argument("--pca-lrs", type=float, nargs="+", default=[0.001, 0.01])
+    p.add_argument("--pca-dims", type=int, nargs="+", default=[32, 64])
+    p.add_argument("--pca-lrs", type=float, nargs="+", default=[0.01])
     p.add_argument("--lv-dims", type=int, nargs="+", default=[32, 64])
-    p.add_argument("--lv-lrs", type=float, nargs="+", default=[0.01, 0.05, 0.1])
-    p.add_argument("--gnn-layers", type=int, nargs="+", default=[1, 2, 3])
+    p.add_argument("--lv-lrs", type=float, nargs="+", default=[0.05, 0.1])
+    p.add_argument("--gnn-layers", type=int, nargs="+", default=[1, 2])
     p.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
-    p.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01, 0.05])
-    p.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
+    p.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
+    p.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--skip-existing", action="store_true")
     p.add_argument("--phase", choices=["all", "hp", "final"], default="all")
     args = p.parse_args()

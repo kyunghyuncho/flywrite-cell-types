@@ -42,6 +42,7 @@ CODE_FILES = [
     "launch_lightning_sweep.py",
     "remote_start_unsup_sweep.sh",
     "remote_status_unsup_sweep.sh",
+    "remote_stop_studio.py",
 ]
 
 DATA_FILES = [
@@ -119,22 +120,34 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--studio-name", default="flywrite-gnn-vsbm")
     parser.add_argument("--machine", default="L4")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=5, help="HP-search LV/GNN epochs")
+    parser.add_argument("--final-epochs", type=int, default=20, help="Final LV/GNN epochs")
     parser.add_argument("--minibatch", type=int, default=2048)
-    parser.add_argument("--pca-max-iter", type=int, default=10_000)
+    parser.add_argument("--pca-max-iter", type=int, default=2_000, help="HP-search PCA steps")
+    parser.add_argument("--final-pca-max-iter", type=int, default=10_000, help="Final PCA steps")
     parser.add_argument("--split-seed", type=int, default=0)
-    parser.add_argument("--pca-dims", type=int, nargs="+", default=[16, 32, 64])
-    parser.add_argument("--pca-lrs", type=float, nargs="+", default=[0.001, 0.01])
+    parser.add_argument("--pca-dims", type=int, nargs="+", default=[32, 64])
+    parser.add_argument("--pca-lrs", type=float, nargs="+", default=[0.01])
     parser.add_argument("--lv-dims", type=int, nargs="+", default=[32, 64])
-    parser.add_argument("--lv-lrs", type=float, nargs="+", default=[0.01, 0.05, 0.1])
-    parser.add_argument("--gnn-layers", type=int, nargs="+", default=[1, 2, 3])
+    parser.add_argument("--lv-lrs", type=float, nargs="+", default=[0.05, 0.1])
+    parser.add_argument("--gnn-layers", type=int, nargs="+", default=[1, 2])
     parser.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
-    parser.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01, 0.05])
-    parser.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
+    parser.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
+    parser.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--phase", choices=["all", "hp", "final"], default="all")
     parser.add_argument("--skip-upload", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
-    parser.add_argument("--stop-after", action="store_true")
+    parser.add_argument(
+        "--stop-after",
+        action="store_true",
+        help="Stop Studio from this client after a polling run finishes.",
+    )
+    parser.add_argument(
+        "--remote-stop-after",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stop Studio from inside the remote job when it finishes (safe if laptop closes).",
+    )
     parser.add_argument("--poll-seconds", type=int, default=120)
     parser.add_argument(
         "--detach-only",
@@ -168,7 +181,10 @@ def main() -> None:
                 print(f"  -> {name}")
                 studio.upload_file(str(local), name)
 
-        out, code = studio_run(studio, "pip install -q torch scipy numpy scikit-learn tqdm pandas")
+        out, code = studio_run(
+            studio,
+            "pip install -q torch scipy numpy scikit-learn tqdm pandas lightning-sdk",
+        )
         if code != 0:
             raise RuntimeError(f"pip failed: {out}")
 
@@ -177,8 +193,11 @@ def main() -> None:
 
         sweep_args = (
             f"--device cuda --phase {args.phase} "
-            f"--split-seed {args.split_seed} --epochs {args.epochs} "
-            f"--minibatch {args.minibatch} --pca-max-iter {args.pca_max_iter} "
+            f"--split-seed {args.split_seed} "
+            f"--epochs {args.epochs} --final-epochs {args.final_epochs} "
+            f"--minibatch {args.minibatch} "
+            f"--pca-max-iter {args.pca_max_iter} "
+            f"--final-pca-max-iter {args.final_pca_max_iter} "
             f"--pca-dims {join_nums(args.pca_dims)} --pca-lrs {join_nums(args.pca_lrs)} "
             f"--lv-dims {join_nums(args.lv_dims)} --lv-lrs {join_nums(args.lv_lrs)} "
             f"--gnn-layers {join_nums(args.gnn_layers)} --gnn-dims {join_nums(args.gnn_dims)} "
@@ -187,12 +206,24 @@ def main() -> None:
         if args.skip_existing:
             sweep_args += " --skip-existing"
 
+        # Export auth into the Studio shell env for remote auto-stop (not written to disk).
+        auth_exports = (
+            f"export LIGHTNING_USER_ID={os.environ['LIGHTNING_USER_ID']!r} "
+            f"LIGHTNING_API_KEY={os.environ['LIGHTNING_API_KEY']!r} "
+            f"LIGHTNING_USERNAME={user!r} "
+            f"LIGHTNING_TEAMSPACE={teamspace!r} "
+            f"STUDIO_NAME={args.studio_name!r}; "
+        )
+
         # Kill any previous detached sweep, then start a fresh nohup job.
         print(f"Detaching unsupervised protocol:\n  {sweep_args}")
+        print(f"remote_stop_after={args.remote_stop_after}")
         start_cmd = (
-            "chmod +x /teamspace/studios/this_studio/remote_start_unsup_sweep.sh "
-            "/teamspace/studios/this_studio/remote_status_unsup_sweep.sh && "
+            auth_exports + "chmod +x /teamspace/studios/this_studio/remote_start_unsup_sweep.sh "
+            "/teamspace/studios/this_studio/remote_status_unsup_sweep.sh "
+            "/teamspace/studios/this_studio/remote_stop_studio.py && "
             f"SWEEP_ARGS={sweep_args!r} "
+            f"REMOTE_STOP_AFTER={'1' if args.remote_stop_after else '0'} "
             "bash /teamspace/studios/this_studio/remote_start_unsup_sweep.sh"
         )
         out, code = studio_run(studio, start_cmd)

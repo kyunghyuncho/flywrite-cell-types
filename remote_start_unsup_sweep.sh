@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Start the unsupervised sweep in the background on a Lightning Studio.
+# If REMOTE_STOP_AFTER=1, stop this Studio after the sweep finishes.
 set -euo pipefail
 
 SWEEP_ARGS="${SWEEP_ARGS:?SWEEP_ARGS must be set}"
 LOG="${REMOTE_LOG:-unsup_sweep.log}"
 DONE="${REMOTE_DONE:-unsup_sweep.done}"
 PIDFILE="${REMOTE_PID:-unsup_sweep.pid}"
+REMOTE_STOP_AFTER="${REMOTE_STOP_AFTER:-0}"
 
 WORK="$(
 python -c "
@@ -36,10 +38,32 @@ if [ -f "$PIDFILE" ]; then
   fi
 fi
 pkill -f 'python run_experiments.py' 2>/dev/null || true
+pkill -f 'train_pca_baseline.py' 2>/dev/null || true
+pkill -f 'train_lv_vsbm.py' 2>/dev/null || true
+pkill -f 'gnn_vsbm.py' 2>/dev/null || true
 rm -f "$DONE" "$LOG"
+rm -f hp_* final_* 2>/dev/null || true
 
-nohup bash -lc "python -u run_experiments.py ${SWEEP_ARGS}; echo \$? > ${DONE}" >"$LOG" 2>&1 &
+WRAPPER="$WORK/remote_run_unsup_sweep.sh"
+cat >"$WRAPPER" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$WORK"
+set +e
+python -u run_experiments.py ${SWEEP_ARGS}
+ec=\$?
+set -e
+echo \$ec > "$DONE"
+if [ "$REMOTE_STOP_AFTER" = "1" ]; then
+  echo "Stopping Studio after sweep (exit=\$ec)..."
+  python "$WORK/remote_stop_studio.py" || echo "Studio stop failed; check credentials/env"
+fi
+exit \$ec
+EOF
+chmod +x "$WRAPPER"
+
+nohup bash "$WRAPPER" >"$LOG" 2>&1 &
 echo $! >"$PIDFILE"
-echo "Started pid=$(cat "$PIDFILE")"
-sleep 2
+echo "Started pid=$(cat "$PIDFILE") remote_stop_after=$REMOTE_STOP_AFTER"
+sleep 3
 tail -n 40 "$LOG" || true
