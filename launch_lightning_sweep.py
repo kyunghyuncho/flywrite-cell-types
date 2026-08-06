@@ -112,8 +112,7 @@ def main() -> None:
         def join_nums(vals: list) -> str:
             return " ".join(str(x) for x in vals)
 
-        cmd = (
-            "python run_experiments.py "
+        sweep_args = (
             f"--device cuda --phase {args.phase} "
             f"--split-seed {args.split_seed} --epochs {args.epochs} "
             f"--minibatch {args.minibatch} --pca-max-iter {args.pca_max_iter} "
@@ -123,8 +122,33 @@ def main() -> None:
             f"--gnn-lrs {join_nums(args.gnn_lrs)} --final-seeds {join_nums(args.final_seeds)}"
         )
         if args.skip_existing:
-            cmd += " --skip-existing"
-        print(f"Running unsupervised protocol:\n  {cmd}")
+            sweep_args += " --skip-existing"
+
+        # Uploads land in the Studio filesystem, but the shell cwd is not always that
+        # directory. Resolve the directory that contains the *new* orchestrator.
+        cmd = f"""
+set -euo pipefail
+WORK=$(python - <<'PY'
+from pathlib import Path
+roots = [Path('.').resolve(), Path.home(), Path('/teamspace/studios/this_studio')]
+for root in roots:
+    for p in root.rglob('run_experiments.py'):
+        try:
+            txt = p.read_text(errors='ignore')
+        except Exception:
+            continue
+        if 'Unsupervised HP search' in txt:
+            print(p.parent)
+            raise SystemExit
+raise SystemExit('new run_experiments.py not found')
+PY
+)
+echo "Using WORK=$WORK"
+cd "$WORK"
+python -c "import run_experiments; print(run_experiments.__doc__.splitlines()[0])"
+python run_experiments.py {sweep_args}
+"""
+        print(f"Running unsupervised protocol:\n  {sweep_args}")
         t0 = time.time()
         out, code = studio.run_with_exit_code(cmd)
         print(out)
