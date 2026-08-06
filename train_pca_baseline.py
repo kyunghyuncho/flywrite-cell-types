@@ -47,6 +47,16 @@ def stochastic_pca_heldout(
         w_hat = torch.mm(ut_w, u.T)
         return w_hat - w_batch + b
 
+    def mean_mse(indices: np.ndarray, chunk: int = 256) -> float:
+        total = 0.0
+        count = 0
+        for start in range(0, len(indices), chunk):
+            sl = indices[start : start + chunk]
+            diff = row_recon_diff(sl)
+            total += float(torch.sum(diff * diff).item())
+            count += int(diff.numel())
+        return total / max(count, 1)
+
     for it in range(max_iter):
         batch = np.random.choice(train_rows, size=min(batch_size, len(train_rows)), replace=False)
         diff = row_recon_diff(batch)
@@ -56,11 +66,11 @@ def stochastic_pca_heldout(
         optimizer.step()
         if it % 500 == 0:
             with torch.no_grad():
-                val = float(torch.mean(row_recon_diff(val_rows) ** 2).item())
+                val = mean_mse(val_rows)
             print(f"PCA iter {it}: train_fro={float(loss.item()):.4f} val_mse={val:.6f}")
 
     with torch.no_grad():
-        val_mse = float(torch.mean(row_recon_diff(val_rows) ** 2).item())
+        val_mse = mean_mse(val_rows)
     return u.detach(), b.detach(), val_mse
 
 
