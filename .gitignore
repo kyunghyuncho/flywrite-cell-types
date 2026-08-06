@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.npz
+*.pkl
+*.npy
+*.pt
+*.csv
+*.csv.gz
+*.png
+uv.lock
