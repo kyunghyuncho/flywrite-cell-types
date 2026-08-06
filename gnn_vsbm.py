@@ -25,6 +25,13 @@ from scipy.sparse import csr_matrix, load_npz
 from torch import nn
 from tqdm import tqdm
 
+from heldout import (
+    heldout_pair_mask,
+    load_heldout,
+    mean_bernoulli_ll,
+    remove_heldout_positives,
+    write_metrics,
+)
 from index_mapping import load_mapping
 
 
@@ -160,9 +167,8 @@ def load_binary_adjacency(path: Path) -> csr_matrix:
     return adj.tocsr()
 
 
-def train(args: argparse.Namespace) -> None:
+def train(args: argparse.Namespace) -> dict:
     device = args.device or pick_device()
-    # Prefer float32 everywhere for sparse GNN stability (esp. on MPS).
     dtype = torch.float32
     torch.manual_seed(args.seed)
 
@@ -170,14 +176,22 @@ def train(args: argparse.Namespace) -> None:
     n = adj_csr.shape[0]
     print(f"Loaded A with shape {adj_csr.shape}, nnz={adj_csr.nnz}, device={device}")
 
-    a_bin = csr_to_torch_sparse(adj_csr, device=device, dtype=dtype)
+    held = load_heldout(Path(args.heldout_pairs))
+    held_src_np = held["src"]
+    held_tgt_np = held["tgt"]
+    held_y = torch.tensor(held["y"], dtype=dtype, device=device)
+    held_src = torch.tensor(held_src_np, dtype=torch.long, device=device)
+    held_tgt = torch.tensor(held_tgt_np, dtype=torch.long, device=device)
+
+    # Message passing graph: remove held-out positive edges to avoid leakage.
+    adj_mp = remove_heldout_positives(adj_csr, held_src_np, held_tgt_np, held["y"])
+    a_bin = csr_to_torch_sparse(adj_mp, device=device, dtype=dtype)
     a_bin_t = torch.sparse_coo_tensor(
         a_bin.indices().flip(0),
         a_bin.values(),
         size=a_bin.size(),
         device=device,
     ).coalesce()
-    # Pre-normalize once; minibatch masking is applied on the binary tensors.
     a_out_full = row_normalize_sparse(a_bin)
     a_in_full = row_normalize_sparse(a_bin_t)
 
@@ -194,6 +208,7 @@ def train(args: argparse.Namespace) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     minibatch = args.minibatch
     n_minibatches = max(n // minibatch, 1)
+    best_val = -float("inf")
 
     try:
         for epoch in range(args.epochs):
@@ -229,10 +244,20 @@ def train(args: argparse.Namespace) -> None:
                     dtype=dtype,
                     device=device,
                 )
-
-                # Mean BCE-with-logits is numerically stable; scale by B^2 so the
-                # magnitude remains comparable to a summed Bernoulli ELBO term.
-                bce = F.binary_cross_entropy_with_logits(logits, cc, reduction="mean")
+                held_mask = torch.tensor(
+                    heldout_pair_mask(
+                        idx_i.cpu().numpy(),
+                        idx_j.cpu().numpy(),
+                        held_src_np,
+                        held_tgt_np,
+                    ),
+                    device=device,
+                )
+                keep = (~held_mask).to(dtype)
+                denom = keep.sum().clamp(min=1.0)
+                bce = (
+                    F.binary_cross_entropy_with_logits(logits, cc, reduction="none") * keep
+                ).sum() / denom
                 ll = -bce * float(idx_i.numel() * idx_j.numel())
 
                 alpha_i = model.soft_assignments(idx_i)
@@ -257,23 +282,66 @@ def train(args: argparse.Namespace) -> None:
                 final_loss = float(loss.item())
                 n_steps += 1
 
-            print(f"Initial loss: {initial_loss}, Final loss: {final_loss} (steps={n_steps})")
+            val_ll = eval_heldout_ll_gnn(model, a_out_full, a_in_full, held_src, held_tgt, held_y)
+            best_val = max(best_val, val_ll)
+            print(
+                f"Initial loss: {initial_loss}, Final loss: {final_loss} "
+                f"(steps={n_steps}) val_ll={val_ll:.6f} best_val_ll={best_val:.6f}"
+            )
             with torch.no_grad():
-                sample = torch.argmax(model.q_logits[:10], dim=-1).cpu().tolist()
                 n_used = int(torch.unique(torch.argmax(model.q_logits, dim=-1)).numel())
-                print(f"Sample hard assignments (nodes 0-9): {sample}")
                 print(f"Unique hard clusters in use: {n_used}/{args.k}")
     except KeyboardInterrupt:
         print("Training interrupted.")
 
-    save_results(model, Path(args.mapping), Path(args.out_prefix))
+    return save_results(
+        model,
+        Path(args.mapping),
+        Path(args.out_prefix),
+        a_out_full,
+        a_in_full,
+        held_src,
+        held_tgt,
+        held_y,
+        args,
+    )
 
 
-def save_results(model: GNNvSBM, mapping_path: Path, out_prefix: Path) -> None:
+@torch.no_grad()
+def eval_heldout_ll_gnn(
+    model: GNNvSBM,
+    a_out: torch.Tensor,
+    a_in: torch.Tensor,
+    held_src: torch.Tensor,
+    held_tgt: torch.Tensor,
+    held_y: torch.Tensor,
+    chunk: int = 8192,
+) -> float:
+    h_src, h_tgt = model.encode(a_out, a_in)
+    lls = []
+    for start in range(0, held_src.numel(), chunk):
+        sl = slice(start, start + chunk)
+        logits = (h_src[held_src[sl]] * h_tgt[held_tgt[sl]]).sum(dim=-1) + model.bias
+        lls.append(mean_bernoulli_ll(logits, held_y[sl]))
+    return float(np.mean(lls))
+
+
+def save_results(
+    model: GNNvSBM,
+    mapping_path: Path,
+    out_prefix: Path,
+    a_out: torch.Tensor,
+    a_in: torch.Tensor,
+    held_src: torch.Tensor,
+    held_tgt: torch.Tensor,
+    held_y: torch.Tensor,
+    args: argparse.Namespace,
+) -> dict:
     with torch.no_grad():
         assignments = torch.argmax(model.q_logits, dim=-1).cpu().numpy()
         scores = torch.max(torch.softmax(model.q_logits, dim=-1), dim=-1).values.cpu().numpy()
         u = model.u.detach().cpu().numpy()
+        val_ll = eval_heldout_ll_gnn(model, a_out, a_in, held_src, held_tgt, held_y)
 
     mapping = load_mapping(str(mapping_path))
     cluster_assignment_dict = {mapping[i]: int(assignments[i]) for i in range(len(assignments))}
@@ -281,30 +349,31 @@ def save_results(model: GNNvSBM, mapping_path: Path, out_prefix: Path) -> None:
     np.save(f"{out_prefix}_assignments.npy", assignments)
     np.save(f"{out_prefix}_scores.npy", scores)
     np.save(f"{out_prefix}_U.npy", u)
-    np.save(f"{out_prefix}_assignment_dict_729.npy", cluster_assignment_dict)
-    torch.save(
-        {
-            "q_logits": model.q_logits.detach().cpu(),
-            "u": model.u.detach().cpu(),
-            "bias": model.bias.detach().cpu(),
-            "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-        },
-        f"{out_prefix}_checkpoint.pt",
-    )
-    print(
-        "Saved "
-        f"{out_prefix}_assignments.npy, "
-        f"{out_prefix}_scores.npy, "
-        f"{out_prefix}_U.npy, "
-        f"{out_prefix}_assignment_dict_729.npy, "
-        f"{out_prefix}_checkpoint.pt"
-    )
+    np.save(f"{out_prefix}_assignment_dict.npy", cluster_assignment_dict)
+    metrics = {
+        "method": "gnn_vsbm",
+        "val_metric": val_ll,
+        "val_metric_name": "heldout_bernoulli_ll",
+        "val_metric_higher_is_better": True,
+        "seed": args.seed,
+        "k": args.k,
+        "d": args.d,
+        "layers": args.layers,
+        "lr": args.lr,
+        "entropy_weight": args.entropy_weight,
+        "epochs": args.epochs,
+        "n_pred_clusters": int(len(np.unique(assignments))),
+    }
+    write_metrics(f"{out_prefix}_metrics.json", metrics)
+    print(f"Saved {out_prefix}_* ; val_ll={val_ll:.6f}")
+    return metrics
 
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--adjacency", default="sparse_connectivity_matrix.npz")
     p.add_argument("--mapping", default="root_id_to_index_mapping.json")
+    p.add_argument("--heldout-pairs", default="heldout_pairs.npz")
     p.add_argument("--out-prefix", default="gnn")
     p.add_argument("--k", type=int, default=729)
     p.add_argument("--d", type=int, default=32)

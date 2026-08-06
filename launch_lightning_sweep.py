@@ -1,4 +1,4 @@
-"""Launch full baseline + GNN hyperparameter sweep on Lightning AI (L4/T4).
+"""Launch unsupervised HP search + multi-seed finals on Lightning AI (L4/T4).
 
 Example:
 
@@ -10,6 +10,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -24,6 +25,7 @@ CODE_FILES = [
     "train_lv_vsbm.py",
     "train_pca_baseline.py",
     "sparse_graph_pca.py",
+    "heldout.py",
     "run_experiments.py",
     "evaluate_clustering.py",
     "index_mapping.py",
@@ -61,12 +63,18 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--minibatch", type=int, default=2048)
     parser.add_argument("--pca-max-iter", type=int, default=10_000)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--layers", type=int, nargs="+", default=[1, 2, 3])
-    parser.add_argument("--lrs", type=float, nargs="+", default=[0.005, 0.01, 0.05])
-    parser.add_argument("--dims", type=int, nargs="+", default=[32, 64])
-    parser.add_argument("--entropy-weights", type=float, nargs="+", default=[1.0])
+    parser.add_argument("--split-seed", type=int, default=0)
+    parser.add_argument("--pca-dims", type=int, nargs="+", default=[16, 32, 64])
+    parser.add_argument("--pca-lrs", type=float, nargs="+", default=[0.001, 0.01])
+    parser.add_argument("--lv-dims", type=int, nargs="+", default=[32, 64])
+    parser.add_argument("--lv-lrs", type=float, nargs="+", default=[0.01, 0.05, 0.1])
+    parser.add_argument("--gnn-layers", type=int, nargs="+", default=[1, 2, 3])
+    parser.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
+    parser.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01, 0.05])
+    parser.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
+    parser.add_argument("--phase", choices=["all", "hp", "final"], default="all")
     parser.add_argument("--skip-upload", action="store_true")
+    parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--stop-after", action="store_true")
     args = parser.parse_args()
     require_auth()
@@ -101,33 +109,40 @@ def main() -> None:
         if code != 0:
             raise RuntimeError(f"pip failed: {out}")
 
-        layers = " ".join(str(x) for x in args.layers)
-        lrs = " ".join(str(x) for x in args.lrs)
-        dims = " ".join(str(x) for x in args.dims)
-        ents = " ".join(str(x) for x in args.entropy_weights)
+        def join_nums(vals: list) -> str:
+            return " ".join(str(x) for x in vals)
+
         cmd = (
             "python run_experiments.py "
-            f"--device cuda --seed {args.seed} --epochs {args.epochs} "
+            f"--device cuda --phase {args.phase} "
+            f"--split-seed {args.split_seed} --epochs {args.epochs} "
             f"--minibatch {args.minibatch} --pca-max-iter {args.pca_max_iter} "
-            f"--layers {layers} --lrs {lrs} --dims {dims} "
-            f"--entropy-weights {ents}"
+            f"--pca-dims {join_nums(args.pca_dims)} --pca-lrs {join_nums(args.pca_lrs)} "
+            f"--lv-dims {join_nums(args.lv_dims)} --lv-lrs {join_nums(args.lv_lrs)} "
+            f"--gnn-layers {join_nums(args.gnn_layers)} --gnn-dims {join_nums(args.gnn_dims)} "
+            f"--gnn-lrs {join_nums(args.gnn_lrs)} --final-seeds {join_nums(args.final_seeds)}"
         )
-        print(f"Running sweep:\n  {cmd}")
+        if args.skip_existing:
+            cmd += " --skip-existing"
+        print(f"Running unsupervised protocol:\n  {cmd}")
         t0 = time.time()
         out, code = studio.run_with_exit_code(cmd)
         print(out)
         if code != 0:
             raise RuntimeError(f"Sweep failed with exit code {code}")
-        print(f"Sweep finished in {time.time() - t0:.1f}s")
+        print(f"Finished in {time.time() - t0:.1f}s")
 
         artifacts = [
-            "sweep_results.json",
-            "sweep_results.csv",
-            "sweep_best.json",
-            "lv_sweep_assignment_dict.npy",
-            "pca_sweep_assignment_dict.npy",
+            "heldout_pairs.npz",
+            "heldout_rows.npz",
+            "hp_results.json",
+            "hp_results.csv",
+            "hp_best.json",
+            "final_results.json",
+            "final_results.csv",
+            "final_summary.json",
+            "final_summary.csv",
         ]
-        # Also download the best GNN assignment if listed in sweep_best.json
         print("Downloading summary artifacts...")
         for name in artifacts:
             try:
@@ -136,21 +151,28 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001
                 print(f"  ! {name}: {exc}")
 
-        # Download all assignment dicts produced by the sweep.
+        # Prefer final multi-seed assignment dicts; fall back to HP ones.
         list_cmd = (
-            'python -c "import glob; '
-            "print('\\\\n'.join(sorted(glob.glob('*_assignment_dict*.npy'))))\""
+            'python -c "import glob,json; '
+            "print('\\\\n'.join(sorted(glob.glob('final_*_assignment_dict*.npy') "
+            "+ glob.glob('hp_*_assignment_dict*.npy') "
+            "+ glob.glob('*_metrics.json'))))\""
         )
         out, _ = studio.run_with_exit_code(list_cmd)
         for line in (out or "").splitlines():
             name = line.strip()
-            if not name.endswith(".npy"):
+            if not name:
                 continue
             try:
                 studio.download_file(name, str(REPO_ROOT / name))
                 print(f"  <- {name}")
             except Exception as exc:  # noqa: BLE001
                 print(f"  ! {name}: {exc}")
+
+        summary_path = REPO_ROOT / "final_summary.json"
+        if summary_path.exists():
+            print("Final uncertainty summary:")
+            print(json.dumps(json.loads(summary_path.read_text()), indent=2))
     finally:
         if args.stop_after:
             print("Stopping Studio...")

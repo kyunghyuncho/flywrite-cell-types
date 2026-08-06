@@ -79,57 +79,52 @@ uv run python gnn_vsbm.py --epochs 20 --minibatch 2048 --lr 0.01 --seed 0 --out-
 Implemented in [`sparse_graph_pca.py`](sparse_graph_pca.py): stochastic linear
 autoencoding of the adjacency followed by $k$-means in the embedding space.
 
-## Evaluation
+## Evaluation protocol (unsupervised selection)
 
-Cluster quality is measured by aligning predicted clusters to the 729 annotated visual
-neuron types with the Hungarian algorithm on the confusion matrix (higher is better),
-plus ARI and NMI. See [`evaluate_clustering.py`](evaluate_clustering.py):
+Ground-truth visual types are **not** used for hyperparameter selection. Selection uses
+held-out unsupervised metrics only ([`heldout.py`](heldout.py)):
+
+1. **Fixed splits** (shared across methods; `split_seed=0` by default):
+   - LV / GNN: ~50k held-out positive directed edges + 50k negatives. Held-out positives
+     are removed from the GNN message-passing graph and excluded from the training LL.
+   - PCA: ~10% of rows held out for reconstruction scoring.
+2. **Phase 1 — HP search:** each method sweeps its own grid; pick the setting that
+   maximizes held-out Bernoulli log-likelihood (LV/GNN) or minimizes held-out row MSE
+   (PCA; stored as negated MSE so higher is always better).
+3. **Phase 2 — multi-seed finals:** retrain the selected setting with several seeds
+   (default `0..4`). Report Hungarian / ARI / NMI vs visual types as mean ± std.
+
+Orchestration: [`run_experiments.py`](run_experiments.py). Outputs:
+`hp_results.*`, `hp_best.json`, `final_results.*`, `final_summary.*`.
+
+```bash
+# Local (CPU/MPS; slow for full grids)
+uv run python run_experiments.py --device cpu --phase all
+
+# Lightning L4 (recommended)
+source ~/.ortet/lightning.env
+export LIGHTNING_USERNAME=kc119 LIGHTNING_TEAMSPACE=vision-model
+uv run python launch_lightning_sweep.py --machine L4 --epochs 20 --stop-after
+```
+
+Single-run evaluation against GT (after training):
 
 ```bash
 uv run python evaluate_clustering.py \
-  --pred gnn_assignment_dict_729.npy \
-         cluster_assignment_dict_729.npy \
-         pca_cluster_assignment_dict_729.npy
+  --pred final_gnn_*_assignment_dict.npy \
+         final_lv_*_assignment_dict.npy \
+         final_pca_*_assignment_dict.npy
 ```
 
-Interactive inspection of the L4 sweep (leaderboard, hyperparameter heatmaps,
-confusion matrices, pairwise agreement) is in
-[`inspect_sweep_results.ipynb`](inspect_sweep_results.ipynb):
+Interactive inspection:
+[`inspect_sweep_results.ipynb`](inspect_sweep_results.ipynb).
 
-```bash
-uv run jupyter notebook inspect_sweep_results.ipynb
-```
+### Earlier GT-selected sweep (for reference only)
 
-An earlier ad-hoc comparison notebook remains at
-[`cluster_similarity_test.ipynb`](cluster_similarity_test.ipynb).
-
-### Reference scores (visual neurons, $K=729$, seed $0$, $20$ epochs on L4)
-
-Hyperparameter grid for GNN-vSBM: $L\in\{1,2,3\}$, $d\in\{32,64\}$,
-$\mathrm{lr}\in\{0.005,0.01,0.05\}$. Full table in [`sweep_results.csv`](sweep_results.csv).
-
-| Method | Hungarian vs GT | Notes |
-| --- | ---: | --- |
-| **GNN-vSBM best** ($L{=}1$, $d{=}64$, $\mathrm{lr}{=}0.005$) | **3078** | best of 18 GNN configs |
-| GNN-vSBM ($L{=}1$, $d{=}32$, $\mathrm{lr}{=}0.01$) | 2990 | close second |
-| Low-rank vSBM (re-run, $20$ epochs) | 2717 | single-hop baseline on same budget |
-| Low-rank vSBM (earlier long run) | 3139 | saved historical checkpoint |
-| PCA + $k$-means (re-run) | 1440 | $d{=}32$, $10^4$ SGD steps |
-| Random (optimistic / pessimistic) | $\approx$1230 / $\approx$980 | |
-
-**Takeaways.** On a matched $20$-epoch budget, the best GNN decoder (**3078**) beats the
-re-run single-hop vSBM (**2717**) and PCA (**1440**). Shallower GNNs with smaller learning
-rates worked best; $\mathrm{lr}{=}0.05$ consistently underperformed. Deeper stacks ($L{=}2,3$)
-did not help under this training budget—an open question for longer runs or residual /
-normalization ablations.
-
-Reproduce the sweep:
-
-```bash
-source ~/.ortet/lightning.env
-export LIGHTNING_USERNAME=kc119 LIGHTNING_TEAMSPACE=vision-model
-uv run python launch_lightning_sweep.py --machine L4 --epochs 20 --seed 0 --stop-after
-```
+An earlier L4 grid selected GNN configs by Hungarian vs GT (flawed for unsupervised
+methods). Under that protocol the best GNN scored **3078**, LV **2717**, PCA **1440**
+(see historical [`sweep_results.csv`](sweep_results.csv)). Those numbers are **not**
+comparable to the unsupervised protocol above.
 
 
 ## Environment
