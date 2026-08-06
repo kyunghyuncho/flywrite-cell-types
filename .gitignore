@@ -9,4 +9,5 @@ __pycache__/
 *.csv
 *.csv.gz
 *.png
+root_id_to_index_mapping.json
 uv.lock
