@@ -96,35 +96,156 @@ held-out unsupervised metrics only ([`heldout.py`](heldout.py)):
    maximizes held-out Bernoulli log-likelihood (LV/GNN) or minimizes held-out row MSE
    (PCA; stored as negated MSE so higher is always better).
 3. **Phase 2 — multi-seed finals:** retrain the selected setting with several seeds
-   (default `0..4`). Report Hungarian / ARI / NMI vs visual types as mean ± std.
+   (default `0,1,2`). Report Hungarian / ARI / NMI vs visual types as mean ± std.
 
 Orchestration: [`run_experiments.py`](run_experiments.py). Outputs:
 `hp_results.*`, `hp_best.json`, `final_results.*`, `final_summary.*`.
 
-```bash
-# Local (CPU/MPS; slow for full grids)
-uv run python run_experiments.py --device cpu --phase all
-
-# Lightning L4 (detached; Studio stops itself when done)
-source ~/.ortet/lightning.env
-export LIGHTNING_USERNAME=kc119 LIGHTNING_TEAMSPACE=vision-model
-uv run python launch_lightning_sweep.py --machine L4 --detach-only --remote-stop-after
-```
-
 Lean default GNN HP grid: $L\in\{0,1,2,4\}$, $d\in\{32,64\}$,
 $\mathrm{lr}\in\{0.005,0.01\}$ (short HP epochs, full finals, 3 seeds).
 
-Single-run evaluation against GT (after training):
+
+## End-to-end workflow
+
+Prerequisites: data artifacts in the repo root
+(`sparse_connectivity_matrix.npz`, `root_id_to_index_mapping.json`,
+`root_id_type_dict.pkl`) and a `uv` environment (`uv sync --exclude-newer "1 week"`).
+
+### Local (CPU / MPS / local CUDA)
+
+Full unsupervised HP search + multi-seed finals (slow on CPU/MPS):
 
 ```bash
+uv run python run_experiments.py --device cpu --phase all
+# or: --device mps / --device cuda
+```
+
+Useful flags: `--phase hp|final`, `--skip-existing`, `--epochs` / `--final-epochs`,
+`--gnn-layers 0 1 2 4`, `--final-seeds 0 1 2`.
+
+When finished, inspect results:
+
+```bash
+# tabular summary
+uv run python -c "import pandas as pd; print(pd.read_csv('final_summary.csv').to_string(index=False))"
+
+# Hungarian / ARI / NMI for saved assignment dicts
 uv run python evaluate_clustering.py \
   --pred final_gnn_*_assignment_dict.npy \
          final_lv_*_assignment_dict.npy \
          final_pca_*_assignment_dict.npy
+
+# interactive plots (HP leaderboard, val vs GT, seed uncertainty)
+uv run jupyter notebook inspect_sweep_results.ipynb
 ```
 
-Interactive inspection:
-[`inspect_sweep_results.ipynb`](inspect_sweep_results.ipynb).
+The notebook expects `hp_results.csv`, `hp_best.json`, `final_results.csv`, and
+`final_summary.csv` in the working directory.
+
+Single-model smoke tests (optional):
+
+```bash
+uv run python train_pca_baseline.py --max-iter 200 --seed 0 --out-prefix smoke_pca
+uv run python train_lv_vsbm.py --epochs 1 --max-updates 5 --seed 0 --out-prefix smoke_lv
+uv run python gnn_vsbm.py --epochs 1 --max-updates 5 --layers 2 --seed 0 --out-prefix smoke_gnn
+```
+
+### Lightning AI (recommended for the full grid)
+
+Install the SDK once, and put API keys in `~/.ortet/lightning.env`
+(`LIGHTNING_USER_ID`, `LIGHTNING_API_KEY`). GPU Studios need a verified payment method.
+
+**1. Launch a detached sweep** (uploads code/data, starts `run_experiments.py` under
+`nohup`, returns immediately). By default the Studio **stops itself** when the job
+finishes, so a closed laptop still ends billing:
+
+```bash
+source ~/.ortet/lightning.env
+export LIGHTNING_USERNAME=kc119 LIGHTNING_TEAMSPACE=vision-model
+uv pip install lightning-sdk
+
+uv run python launch_lightning_sweep.py \
+  --machine L4 \
+  --detach-only \
+  --remote-stop-after
+```
+
+Omit `--detach-only` to poll from the client and download artifacts when done
+(requires the laptop to stay online). Use `--skip-upload` on restarts if the Studio
+already has code and data.
+
+**2. Check progress** while the Studio is running:
+
+```bash
+uv run python -c "
+import os
+from lightning_sdk import Studio
+s = Studio('flywrite-gnn-vsbm',
+           teamspace=os.environ['LIGHTNING_TEAMSPACE'],
+           user=os.environ['LIGHTNING_USERNAME'])
+print(s.run_with_exit_code('bash /teamspace/studios/this_studio/remote_status_unsup_sweep.sh')[0])
+"
+```
+
+Remote log: `/teamspace/studios/this_studio/unsup_sweep.log`. Done marker:
+`unsup_sweep.done` (contains the exit code).
+
+**3. Download results and inspect locally.** If the Studio already auto-stopped,
+start a cheap CPU instance only for download, then stop again:
+
+```bash
+source ~/.ortet/lightning.env
+export LIGHTNING_USERNAME=kc119 LIGHTNING_TEAMSPACE=vision-model
+
+uv run python - <<'PY'
+import os
+from pathlib import Path
+from lightning_sdk import Studio, Machine
+
+s = Studio(
+    "flywrite-gnn-vsbm",
+    teamspace=os.environ["LIGHTNING_TEAMSPACE"],
+    user=os.environ["LIGHTNING_USERNAME"],
+)
+s.start(Machine.CPU)
+root = Path(".")
+for name in [
+    "hp_best.json",
+    "hp_results.csv",
+    "final_summary.csv",
+    "final_results.csv",
+    "final_summary.json",
+    "final_results.json",
+    "unsup_sweep.log",
+]:
+    try:
+        s.download_file(name, str(root / name))
+        print("<-", name)
+    except Exception as e:
+        print("!", name, e)
+
+out, _ = s.run_with_exit_code(
+    "cd /teamspace/studios/this_studio && "
+    "python -c \"import glob; print('\\\\n'.join("
+    "sorted(glob.glob('final_*_assignment_dict*.npy'))))\""
+)
+for line in (out or "").splitlines():
+    name = line.strip()
+    if name.endswith(".npy"):
+        s.download_file(name, str(root / name))
+        print("<-", name)
+s.stop()
+PY
+
+uv run jupyter notebook inspect_sweep_results.ipynb
+```
+
+Alternatively, a single-run GNN train (no HP sweep) is available via
+[`launch_lightning_train.py`](launch_lightning_train.py):
+
+```bash
+uv run python launch_lightning_train.py --machine L4 --epochs 20 --stop-after
+```
 
 ### Earlier GT-selected sweep (for reference only)
 
@@ -145,26 +266,6 @@ uv run python <script>.py
 
 over ad-hoc `pip install`. A legacy [`requirements.txt`](requirements.txt) is retained
 for reference but is no longer the primary install path.
-
-## Training on Lightning AI (recommended for full runs)
-
-Full-graph GNN training on CPU/MPS is slow ($\sim$1–2 s/step). Use a Lightning Studio
-GPU (L4 or T4) via [`launch_lightning_train.py`](launch_lightning_train.py):
-
-```bash
-# Programmatic keys: lightning.ai → profile → Keys
-source ~/.ortet/lightning.env   # or export LIGHTNING_USER_ID / LIGHTNING_API_KEY
-export LIGHTNING_USERNAME=kc119
-export LIGHTNING_TEAMSPACE=vision-model
-
-uv pip install lightning-sdk
-uv run python launch_lightning_train.py --machine L4 --epochs 20 --stop-after
-```
-
-**Note.** GPU machines require a verified payment method on Lightning. After billing is
-enabled, the launcher boots an L4, optionally uploads code/data, trains with
-`--device cuda`, evaluates, downloads artifacts, and can stop the Studio with
-`--stop-after`. Use `--skip-upload` when the Studio already has the files.
 
 
 ## License
