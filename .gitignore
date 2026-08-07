@@ -7,7 +7,6 @@ __pycache__/
 *.npy
 *.pt
 *.csv
-!sweep_results.csv
 !hp_results.csv
 !final_results.csv
 !final_summary.csv

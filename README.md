@@ -247,13 +247,6 @@ Alternatively, a single-run GNN train (no HP sweep) is available via
 uv run python launch_lightning_train.py --machine L4 --epochs 20 --stop-after
 ```
 
-### Earlier GT-selected sweep (for reference only)
-
-An earlier L4 grid selected GNN configs by Hungarian vs GT (flawed for unsupervised
-methods). Under that protocol the best GNN scored **3078**, LV **2717**, PCA **1440**
-(see historical [`sweep_results.csv`](sweep_results.csv)). Those numbers are **not**
-comparable to the unsupervised protocol above.
-
 
 ## Environment
 
