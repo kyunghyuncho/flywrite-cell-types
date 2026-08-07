@@ -5,3 +5,6 @@ pandas
 scikit-learn
 torch
 tqdm
+ntac
+numba
+bottleneck

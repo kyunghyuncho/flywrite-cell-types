@@ -31,6 +31,7 @@ CODE_FILES = [
     "gnn_e_vsbm.py",
     "train_lv_vsbm.py",
     "train_lv_e.py",
+    "train_ntac.py",
     "train_pca_baseline.py",
     "sparse_graph_pca.py",
     "heldout.py",
@@ -144,13 +145,16 @@ def main() -> None:
     parser.add_argument("--gnn-e-d-es", type=int, nargs="+", default=[16])
     parser.add_argument("--gnn-e-lrs", type=float, nargs="+", default=[0.005, 0.01])
     parser.add_argument("--gnn-e-wds", type=float, nargs="+", default=[1e-2])
+    parser.add_argument("--ntac-max-ks", type=int, nargs="+", default=[729])
+    parser.add_argument("--ntac-max-iters", type=int, nargs="+", default=[12])
+    parser.add_argument("--ntac-frac-seeds", type=float, nargs="+", default=[0.1])
     parser.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument(
         "--methods",
         nargs="+",
         default=["pca", "lv", "lv_e", "gnn_e"],
-        choices=["pca", "lv", "lv_e", "gnn", "gnn_e"],
-        help="Methods to sweep (default: pca lv lv_e gnn_e)",
+        choices=["pca", "lv", "lv_e", "gnn", "gnn_e", "ntac"],
+        help="Methods to sweep",
     )
     parser.add_argument("--phase", choices=["all", "hp", "final"], default="all")
     parser.add_argument("--skip-upload", action="store_true")
@@ -201,7 +205,8 @@ def main() -> None:
 
         out, code = studio_run(
             studio,
-            "pip install -q torch scipy numpy scikit-learn tqdm pandas lightning-sdk",
+            "pip install -q torch scipy numpy scikit-learn tqdm pandas lightning-sdk "
+            "ntac numba bottleneck",
         )
         if code != 0:
             raise RuntimeError(f"pip failed: {out}")
@@ -231,6 +236,9 @@ def main() -> None:
             f"--gnn-e-d-es {join_nums(args.gnn_e_d_es)} "
             f"--gnn-e-lrs {join_nums(args.gnn_e_lrs)} "
             f"--gnn-e-wds {join_nums(args.gnn_e_wds)} "
+            f"--ntac-max-ks {join_nums(args.ntac_max_ks)} "
+            f"--ntac-max-iters {join_nums(args.ntac_max_iters)} "
+            f"--ntac-frac-seeds {join_nums(args.ntac_frac_seeds)} "
             f"--final-seeds {join_nums(args.final_seeds)}"
         )
         if args.skip_existing:

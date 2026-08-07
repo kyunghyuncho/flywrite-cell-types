@@ -272,6 +272,43 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                     ],
                                 )
                             )
+
+    if "ntac" in methods:
+        for max_k in args.ntac_max_ks:
+            for max_iter in args.ntac_max_iters:
+                for frac in args.ntac_frac_seeds:
+                    name = f"hp_ntac_k{max_k}_R{max_iter}_T{frac}"
+                    prefix = name
+                    specs.append(
+                        RunSpec(
+                            name=name,
+                            method="ntac",
+                            prefix=prefix,
+                            hyperparams={
+                                "d": int(max_k),
+                                "max_k": int(max_k),
+                                "max_iterations": int(max_iter),
+                                "frac_seeds": float(frac),
+                                "lr": 0.0,
+                            },
+                            command=[
+                                py,
+                                "train_ntac.py",
+                                "--max-k",
+                                str(max_k),
+                                "--max-iterations",
+                                str(max_iter),
+                                "--frac-seeds",
+                                str(frac),
+                                "--seed",
+                                str(args.split_seed),
+                                "--device",
+                                args.device,
+                                "--out-prefix",
+                                prefix,
+                            ],
+                        )
+                    )
     return specs
 
 
@@ -416,6 +453,27 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     "--out-prefix",
                     name,
                 ]
+            elif method == "ntac":
+                name = (
+                    f"final_ntac_k{hp['max_k']}_R{hp['max_iterations']}_"
+                    f"T{hp['frac_seeds']}_seed{seed}"
+                )
+                cmd = [
+                    py,
+                    "train_ntac.py",
+                    "--max-k",
+                    str(hp["max_k"]),
+                    "--max-iterations",
+                    str(hp["max_iterations"]),
+                    "--frac-seeds",
+                    str(hp["frac_seeds"]),
+                    "--seed",
+                    str(seed),
+                    "--device",
+                    args.device,
+                    "--out-prefix",
+                    name,
+                ]
             else:
                 raise ValueError(f"Unknown method for finals: {method}")
             specs.append(
@@ -488,12 +546,15 @@ def main() -> None:
     p.add_argument("--gnn-e-d-es", type=int, nargs="+", default=[16])
     p.add_argument("--gnn-e-lrs", type=float, nargs="+", default=[0.005, 0.01])
     p.add_argument("--gnn-e-wds", type=float, nargs="+", default=[1e-2])
+    p.add_argument("--ntac-max-ks", type=int, nargs="+", default=[729])
+    p.add_argument("--ntac-max-iters", type=int, nargs="+", default=[12])
+    p.add_argument("--ntac-frac-seeds", type=float, nargs="+", default=[0.1])
     p.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument(
         "--methods",
         nargs="+",
-        default=["pca", "lv", "lv_e", "gnn", "gnn_e"],
-        choices=["pca", "lv", "lv_e", "gnn", "gnn_e"],
+        default=["pca", "lv", "lv_e", "gnn", "gnn_e", "ntac"],
+        choices=["pca", "lv", "lv_e", "gnn", "gnn_e", "ntac"],
         help="Which methods to include in HP search / finals",
     )
     p.add_argument("--skip-existing", action="store_true")
@@ -548,6 +609,14 @@ def main() -> None:
                 hp["layers"] = int(best["layers"])
                 hp["d_e"] = int(best["d_e"])
                 hp["e_wd"] = float(best["e_wd"])
+            if method == "ntac":
+                hp = {
+                    "d": int(best["d"]),
+                    "lr": float(best.get("lr", 0.0)),
+                    "max_k": int(best["max_k"]),
+                    "max_iterations": int(best["max_iterations"]),
+                    "frac_seeds": float(best["frac_seeds"]),
+                }
             best_by_method[method] = {
                 "name": best["name"],
                 "val_metric": best["val_metric"],

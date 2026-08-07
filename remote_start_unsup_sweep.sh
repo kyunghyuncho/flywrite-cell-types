@@ -43,6 +43,7 @@ pkill -f 'train_lv_vsbm.py' 2>/dev/null || true
 pkill -f 'train_lv_e.py' 2>/dev/null || true
 pkill -f 'gnn_vsbm.py' 2>/dev/null || true
 pkill -f 'gnn_e_vsbm.py' 2>/dev/null || true
+pkill -f 'train_ntac.py' 2>/dev/null || true
 rm -f "$DONE" "$LOG"
 rm -f hp_* final_* 2>/dev/null || true
 

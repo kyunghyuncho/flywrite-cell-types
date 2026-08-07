@@ -84,6 +84,19 @@ Weight decay applies only to raw $e$.
 uv run python gnn_e_vsbm.py --epochs 1 --max-updates 5 --layers 2 --seed 0
 ```
 
+### Unseeded NTAC (connectivity-only equitable partitioning)
+
+Wraps the official implementation of
+[Schwartzman et al., Nat Commun 2026](https://www.nature.com/articles/s41467-025-68044-1)
+([`ntac`](https://github.com/BenJourdan/ntac)). Unseeded NTAC grows an approximate
+equitable partition using seeded NTAC as a subroutine. Paper defaults:
+$K{=}729$, $R{=}12$ seeded iterations, $T{=}0.1$ seed-candidate fraction.
+Selection uses negated mean Jaccard cost (higher better).
+
+```bash
+uv run python train_ntac.py --max-k 729 --max-iterations 12 --frac-seeds 0.1 --seed 0
+```
+
 ### GNN-vSBM (multi-hop residual)
 
 Implemented in [`gnn_vsbm.py`](gnn_vsbm.py). Soft assignments feed a **low-rank LV
@@ -144,12 +157,13 @@ held-out unsupervised metrics only ([`heldout.py`](heldout.py)):
 
 Orchestration: [`run_experiments.py`](run_experiments.py). Outputs:
 `hp_results.*`, `hp_best.json`, `final_results.*`, `final_summary.*`.
-Select methods with `--methods` (e.g. `pca lv lv_e gnn_e`).
+Select methods with `--methods` (e.g. `lv lv_e ntac`).
 
 Lean LV+$e$ HP grid: $d\in\{32,64\}$, $d_e\in\{16,32\}$, $\mathrm{lr}\in\{0.05,0.1\}$,
 $e_{\mathrm{wd}}\in\{10^{-3},10^{-2}\}$. Lean GNN$_e$ grid: $L\in\{0,1,2\}$,
 $d\in\{32,64\}$, $d_e{=}16$, $\mathrm{lr}\in\{0.005,0.01\}$, $e_{\mathrm{wd}}{=}10^{-2}$.
-Optional α-GNN grid: $L\in\{0,1,2,4\}$, $d\in\{32,64\}$, $\mathrm{lr}\in\{0.005,0.01\}$.
+NTAC defaults: $K{=}729$, $R{=}12$, $T{=}0.1$ (paper). Optional α-GNN grid:
+$L\in\{0,1,2,4\}$, $d\in\{32,64\}$, $\mathrm{lr}\in\{0.005,0.01\}$.
 
 
 ## End-to-end workflow
