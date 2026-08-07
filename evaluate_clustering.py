@@ -79,17 +79,64 @@ def evaluate_pair(pred: dict[Any, Any], gt: dict[Any, Any]) -> dict[str, float]:
     }
 
 
+def random_assignment_baseline(
+    gt_labels: np.ndarray,
+    k: int = 729,
+    n_seeds: int = 20,
+    seed: int = 0,
+) -> dict[str, float]:
+    """Assign each neuron uniformly at random to one of ``k`` clusters.
+
+    Returns mean ± std over ``n_seeds`` of Hungarian / ARI / NMI, plus the
+    theoretical ceilings (perfect recovery of the GT partition on this set).
+    """
+    n = int(gt_labels.shape[0])
+    rng = np.random.default_rng(seed)
+    hun: list[float] = []
+    ari: list[float] = []
+    nmi: list[float] = []
+    for _ in range(n_seeds):
+        pred = rng.integers(0, k, size=n, dtype=np.int64)
+        hun.append(hungarian_score(gt_labels, pred))
+        ari.append(float(adjusted_rand_score(gt_labels, pred)))
+        nmi.append(float(normalized_mutual_info_score(gt_labels, pred)))
+    hun_a = np.asarray(hun, dtype=float)
+    ari_a = np.asarray(ari, dtype=float)
+    nmi_a = np.asarray(nmi, dtype=float)
+    ddof = 1 if n_seeds > 1 else 0
+    return {
+        "n_shared": float(n),
+        "k": float(k),
+        "n_seeds": float(n_seeds),
+        "hungarian_mean": float(hun_a.mean()),
+        "hungarian_std": float(hun_a.std(ddof=ddof)),
+        "ari_mean": float(ari_a.mean()),
+        "ari_std": float(ari_a.std(ddof=ddof)),
+        "nmi_mean": float(nmi_a.mean()),
+        "nmi_std": float(nmi_a.std(ddof=ddof)),
+        # Perfect recovery of the GT labels on this shared set.
+        "hungarian_max": float(n),
+        "ari_max": 1.0,
+        "nmi_max": 1.0,
+    }
+
+
 def random_baselines(
     gt_labels: np.ndarray,
     seed: int = 0,
+    k: int = 729,
+    n_seeds: int = 20,
 ) -> dict[str, float]:
+    """Back-compat wrapper plus the multi-seed random-assignment baseline."""
     rng = np.random.default_rng(seed)
     optimistic = rng.permutation(gt_labels)
     pessimistic = rng.integers(0, len(np.unique(gt_labels)), size=gt_labels.shape[0])
-    return {
+    out = {
         "random_optimistic_hungarian": hungarian_score(gt_labels, optimistic),
         "random_pessimistic_hungarian": hungarian_score(gt_labels, pessimistic),
     }
+    out.update(random_assignment_baseline(gt_labels, k=k, n_seeds=n_seeds, seed=seed))
+    return out
 
 
 def main() -> None:
@@ -108,6 +155,8 @@ def main() -> None:
         help="One or more .npy assignment dicts (root_id -> cluster id)",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--k", type=int, default=729, help="Clusters for random baseline")
+    parser.add_argument("--n-random-seeds", type=int, default=20)
     args = parser.parse_args()
 
     gt = load_ground_truth(args.gt)
@@ -124,10 +173,22 @@ def main() -> None:
             print(f"  {k}: {v}")
 
     if first_gt_labels is not None:
-        baselines = random_baselines(first_gt_labels, seed=args.seed)
-        print("\n=== random baselines ===")
-        for k, v in baselines.items():
-            print(f"  {k}: {v}")
+        baselines = random_baselines(
+            first_gt_labels, seed=args.seed, k=args.k, n_seeds=args.n_random_seeds
+        )
+        print("\n=== random baselines (uniform over K clusters) ===")
+        for key in (
+            "hungarian_mean",
+            "hungarian_std",
+            "ari_mean",
+            "nmi_mean",
+            "hungarian_max",
+        ):
+            print(f"  {key}: {baselines[key]}")
+        print(
+            f"  (also optimistic={baselines['random_optimistic_hungarian']:.1f}, "
+            f"pessimistic={baselines['random_pessimistic_hungarian']:.1f})"
+        )
 
 
 if __name__ == "__main__":
