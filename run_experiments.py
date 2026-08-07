@@ -530,13 +530,14 @@ def main() -> None:
             )
         Path("final_summary.json").write_text(json.dumps(summary, indent=2))
         with Path("final_summary.csv").open("w", newline="") as f:
-            # flatten hyperparams for CSV
+            # flatten hyperparams for CSV (union of keys across methods)
             flat = []
             for s in summary:
                 row = {k: v for k, v in s.items() if k != "best_hyperparams"}
                 row.update({f"hp_{k}": v for k, v in s["best_hyperparams"].items()})
                 flat.append(row)
-            writer = csv.DictWriter(f, fieldnames=list(flat[0].keys()))
+            fields = sorted({k for row in flat for k in row})
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(flat)
 
