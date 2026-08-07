@@ -41,31 +41,35 @@ $$
 Parameters $\{\beta,U_s,U_t,b\}$ are trained by minibatch maximization of the variational
 lower bound (Bernoulli likelihood under $q$ plus entropy of $\alpha$).
 
-### GNN-vSBM (multi-hop)
+### GNN-vSBM (multi-hop residual)
 
-Implemented in [`gnn_vsbm.py`](gnn_vsbm.py). Soft assignments are projected into a
-$d$-dimensional space, $h_i^{(0)}=\sum_k\alpha_i^k u_k$, and refined by $L$ directed
-GNN layers that aggregate incoming and outgoing neighbours on a
-**minibatch-edge-masked** adjacency:
+Implemented in [`gnn_vsbm.py`](gnn_vsbm.py). Soft assignments feed a **low-rank LV
+bilinear backbone**, and a directed GNN supplies a residual multi-hop correction:
 
 $$
-h^{(l+1)}=\phi\Big(W_{\mathrm{self}}h^{(l)}+W_{\mathrm{in}}\tilde{A}^\top h^{(l)}+W_{\mathrm{out}}\tilde{A}h^{(l)}\Big).
+\mathrm{logit}_{ij}
+=
+(\alpha_i U_s)\cdot(\alpha_j U_t)+b
++\gamma\,(h_i^{\mathrm{src}}\cdot h_j^{\mathrm{tgt}}).
 $$
 
-Source/target heads then decode
+Node features start at $h_i^{(0)}=\sum_k\alpha_i^k u_k$ and are refined by $L$ directed
+GNN layers on a minibatch-edge-masked adjacency (in/out aggregation, LayerNorm,
+residual). **Jumping Knowledge** concatenates $[h^{(0)},\ldots,h^{(L)}]$ and projects
+back to $d$ before the src/tgt heads, so deeper layers expand the receptive field
+without erasing 0-hop cluster identity. Learnable $\gamma$ is initialized at $0$, so
+$L{=}0$ recovers an LV-like decoder.
 
-$$
-p(e_{ij}=1)=\sigma\!\big((h_i^{\mathrm{src}})\cdot(h_j^{\mathrm{tgt}})+b\big).
-$$
-
-Edge masking removes directed edges whose both endpoints lie in the current minibatch
-so the decoder cannot trivially read the labels it is asked to reconstruct. The same
-ELBO is maximized with Adam.
+On this connectome, undirected hop balls (median, excl. self) are already large:
+$L{=}1\sim 18$, $L{=}2\sim 3\times 10^3$, $L{=}3\sim 3.7\times 10^4$,
+$L{=}4\sim 10^5$ nodes. Minibatch edge masking removes $\ll 1\%$ of edges, so
+neighbourhood starvation is not the issue—oversmoothing from replacing the LV
+decoder was. The residual+JK design addresses that.
 
 Smoke / short run:
 
 ```bash
-uv run python gnn_vsbm.py --epochs 1 --max-updates 5 --minibatch 1024 --seed 0
+uv run python gnn_vsbm.py --epochs 1 --max-updates 5 --minibatch 1024 --seed 0 --layers 2
 ```
 
 Longer training (defaults: $K=729$, $d=32$, $L=2$):
@@ -101,11 +105,14 @@ Orchestration: [`run_experiments.py`](run_experiments.py). Outputs:
 # Local (CPU/MPS; slow for full grids)
 uv run python run_experiments.py --device cpu --phase all
 
-# Lightning L4 (recommended)
+# Lightning L4 (detached; Studio stops itself when done)
 source ~/.ortet/lightning.env
 export LIGHTNING_USERNAME=kc119 LIGHTNING_TEAMSPACE=vision-model
-uv run python launch_lightning_sweep.py --machine L4 --epochs 20 --stop-after
+uv run python launch_lightning_sweep.py --machine L4 --detach-only --remote-stop-after
 ```
+
+Lean default GNN HP grid: $L\in\{0,1,2,4\}$, $d\in\{32,64\}$,
+$\mathrm{lr}\in\{0.005,0.01\}$ (short HP epochs, full finals, 3 seeds).
 
 Single-run evaluation against GT (after training):
 

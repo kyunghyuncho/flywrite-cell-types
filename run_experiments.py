@@ -314,7 +314,7 @@ def main() -> None:
     p.add_argument("--pca-lrs", type=float, nargs="+", default=[0.01])
     p.add_argument("--lv-dims", type=int, nargs="+", default=[32, 64])
     p.add_argument("--lv-lrs", type=float, nargs="+", default=[0.05, 0.1])
-    p.add_argument("--gnn-layers", type=int, nargs="+", default=[1, 2])
+    p.add_argument("--gnn-layers", type=int, nargs="+", default=[0, 1, 2, 4])
     p.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
     p.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
     p.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2])

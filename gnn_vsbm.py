@@ -1,15 +1,17 @@
 """GNN-augmented variational stochastic block model (GNN-vSBM).
 
-Extends the low-rank vSBM in ``hidden_markov_graph.py`` by replacing the
-single-hop edge probability
+Extends the low-rank vSBM in ``hidden_markov_graph.py``. Soft assignments
+``alpha = softmax(beta)`` feed a low-rank bilinear edge model, and a directed
+GNN supplies a *residual* multi-hop correction:
 
-    p(e_ij = 1 | z_i, z_j) = sigmoid(u_s^{z_i} · u_t^{z_j} + b)
+    logits_ij = (alpha_i U_s)·(alpha_j U_t) + b
+                + gamma * (h_i^{src} · h_j^{tgt})
 
-with a directed graph neural net that conditions on multi-hop soft cluster
-assignments. Soft assignments alpha = softmax(beta) are projected into a
-d-dimensional embedding space, propagated over the (masked) observed graph,
-and decoded into directed edge probabilities. All parameters are trained by
-maximizing a minibatch estimate of the variational lower bound.
+Hop features are combined with Jumping Knowledge (concat of
+``h^{(0)},…,h^{(L)}`` then a linear map) so deeper layers expand the
+receptive field without erasing 0-hop cluster identity. On this connectome,
+undirected 2-hop balls already cover ~3k nodes (median) and 3-hop ~35k, so
+oversmoothing—not insufficient neighborhood size—is the main risk.
 """
 
 from __future__ import annotations
@@ -33,6 +35,12 @@ from heldout import (
     write_metrics,
 )
 from index_mapping import load_mapping
+
+# Empirically measured undirected hop-ball sizes (excl. self) on FlyWire A.
+HOP_BALL_NOTE = (
+    "Receptive field (undirected hop ball, median excl. self): "
+    "L=1 ~18, L=2 ~3k, L=3 ~37k, L=4 ~105k nodes."
+)
 
 
 def pick_device() -> str:
@@ -73,7 +81,8 @@ def mask_minibatch_edges(adj: torch.Tensor, batch_idx: torch.Tensor) -> torch.Te
     """Zero directed edges whose both endpoints lie in ``batch_idx``.
 
     This prevents the GNN from reading the minibatch edges that the decoder is
-    asked to reconstruct.
+    asked to reconstruct. Empirically this removes ≪1% of edges for typical
+    minibatch sizes, so multi-hop neighborhoods remain intact.
     """
     indices = adj.indices()
     values = adj.values()
@@ -113,7 +122,7 @@ class DirectedGNNLayer(nn.Module):
 
 
 class GNNvSBM(nn.Module):
-    """Mean-field variational SBM with a directed multi-hop GNN decoder."""
+    """Mean-field vSBM with residual multi-hop GNN correction + JK."""
 
     def __init__(
         self,
@@ -123,17 +132,27 @@ class GNNvSBM(nn.Module):
         n_layers: int,
         edge_bias_init: float,
         dtype: torch.dtype,
+        gamma_init: float = 0.0,
     ):
         super().__init__()
         self.n = n
         self.k = k
         self.d = d
+        self.n_layers = n_layers
         self.q_logits = nn.Parameter((1.0 / k) * torch.randn(n, k, dtype=dtype))
+        # Shared projection for GNN node features (0-hop).
         self.u = nn.Parameter((1.0 / np.sqrt(k * d)) * torch.randn(k, d, dtype=dtype))
+        # Low-rank LV prototypes (bilinear decoder backbone).
+        self.u_src = nn.Parameter((1.0 / np.sqrt(k * d)) * torch.randn(k, d, dtype=dtype))
+        self.u_tgt = nn.Parameter((1.0 / np.sqrt(k * d)) * torch.randn(k, d, dtype=dtype))
         self.layers = nn.ModuleList([DirectedGNNLayer(d) for _ in range(n_layers)])
+        # Jumping Knowledge: concat h0..hL then project back to d.
+        self.jk_proj = nn.Linear(d * (n_layers + 1), d, bias=False)
         self.src_head = nn.Linear(d, d, bias=False)
         self.tgt_head = nn.Linear(d, d, bias=False)
         self.bias = nn.Parameter(torch.tensor([edge_bias_init], dtype=dtype))
+        # Residual mix; init near 0 so training can fall back to pure LV.
+        self.gamma = nn.Parameter(torch.tensor([gamma_init], dtype=dtype))
 
     def soft_assignments(self, idx: torch.Tensor | None = None) -> torch.Tensor:
         logits = self.q_logits if idx is None else self.q_logits[idx]
@@ -146,9 +165,12 @@ class GNNvSBM(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         alpha = self.soft_assignments()
         h = alpha @ self.u
+        hops = [h]
         for layer in self.layers:
             h = layer(h, a_out, a_in)
-        return self.src_head(h), self.tgt_head(h)
+            hops.append(h)
+        h_jk = self.jk_proj(torch.cat(hops, dim=-1))
+        return self.src_head(h_jk), self.tgt_head(h_jk)
 
     def edge_logits(
         self,
@@ -157,7 +179,26 @@ class GNNvSBM(nn.Module):
         idx_i: torch.Tensor,
         idx_j: torch.Tensor,
     ) -> torch.Tensor:
-        return (h_src[idx_i] @ h_tgt[idx_j].T) + self.bias
+        alpha_i = self.soft_assignments(idx_i)
+        alpha_j = self.soft_assignments(idx_j)
+        # LV bilinear: (α_i U_s) (α_j U_t)^T
+        lv = (alpha_i @ self.u_src) @ (alpha_j @ self.u_tgt).T
+        gnn = h_src[idx_i] @ h_tgt[idx_j].T
+        return lv + self.bias + self.gamma * gnn
+
+    def pair_logits(
+        self,
+        h_src: torch.Tensor,
+        h_tgt: torch.Tensor,
+        src: torch.Tensor,
+        tgt: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-pair logits for held-out evaluation (not a dense block)."""
+        alpha_s = self.soft_assignments(src)
+        alpha_t = self.soft_assignments(tgt)
+        lv = ((alpha_s @ self.u_src) * (alpha_t @ self.u_tgt)).sum(dim=-1)
+        gnn = (h_src[src] * h_tgt[tgt]).sum(dim=-1)
+        return lv + self.bias + self.gamma * gnn
 
 
 def load_binary_adjacency(path: Path) -> csr_matrix:
@@ -175,6 +216,10 @@ def train(args: argparse.Namespace) -> dict:
     adj_csr = load_binary_adjacency(Path(args.adjacency))
     n = adj_csr.shape[0]
     print(f"Loaded A with shape {adj_csr.shape}, nnz={adj_csr.nnz}, device={device}")
+    print(HOP_BALL_NOTE)
+    print(
+        f"GNN layers L={args.layers} (JK over hops 0..{args.layers}), gamma_init={args.gamma_init}"
+    )
 
     held = load_heldout(Path(args.heldout_pairs))
     held_src_np = held["src"]
@@ -203,6 +248,7 @@ def train(args: argparse.Namespace) -> dict:
         n_layers=args.layers,
         edge_bias_init=edge_bias_init,
         dtype=dtype,
+        gamma_init=args.gamma_init,
     ).to(device=device, dtype=dtype)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -230,7 +276,7 @@ def train(args: argparse.Namespace) -> dict:
                     continue
 
                 batch_union = torch.unique(torch.cat([idx_i, idx_j], dim=0))
-                if args.no_edge_mask:
+                if args.no_edge_mask or args.layers == 0:
                     a_out, a_in = a_out_full, a_in_full
                 else:
                     a_out = row_normalize_sparse(mask_minibatch_edges(a_bin, batch_union))
@@ -284,13 +330,14 @@ def train(args: argparse.Namespace) -> dict:
 
             val_ll = eval_heldout_ll_gnn(model, a_out_full, a_in_full, held_src, held_tgt, held_y)
             best_val = max(best_val, val_ll)
-            print(
-                f"Initial loss: {initial_loss}, Final loss: {final_loss} "
-                f"(steps={n_steps}) val_ll={val_ll:.6f} best_val_ll={best_val:.6f}"
-            )
             with torch.no_grad():
                 n_used = int(torch.unique(torch.argmax(model.q_logits, dim=-1)).numel())
-                print(f"Unique hard clusters in use: {n_used}/{args.k}")
+                gamma = float(model.gamma.item())
+            print(
+                f"Initial loss: {initial_loss}, Final loss: {final_loss} "
+                f"(steps={n_steps}) val_ll={val_ll:.6f} best_val_ll={best_val:.6f} "
+                f"gamma={gamma:.4f} clusters={n_used}/{args.k}"
+            )
     except KeyboardInterrupt:
         print("Training interrupted.")
 
@@ -321,7 +368,7 @@ def eval_heldout_ll_gnn(
     lls = []
     for start in range(0, held_src.numel(), chunk):
         sl = slice(start, start + chunk)
-        logits = (h_src[held_src[sl]] * h_tgt[held_tgt[sl]]).sum(dim=-1) + model.bias
+        logits = model.pair_logits(h_src, h_tgt, held_src[sl], held_tgt[sl])
         lls.append(mean_bernoulli_ll(logits, held_y[sl]))
     return float(np.mean(lls))
 
@@ -342,6 +389,7 @@ def save_results(
         scores = torch.max(torch.softmax(model.q_logits, dim=-1), dim=-1).values.cpu().numpy()
         u = model.u.detach().cpu().numpy()
         val_ll = eval_heldout_ll_gnn(model, a_out, a_in, held_src, held_tgt, held_y)
+        gamma = float(model.gamma.item())
 
     mapping = load_mapping(str(mapping_path))
     cluster_assignment_dict = {mapping[i]: int(assignments[i]) for i in range(len(assignments))}
@@ -360,12 +408,14 @@ def save_results(
         "d": args.d,
         "layers": args.layers,
         "lr": args.lr,
+        "gamma": gamma,
+        "gamma_init": args.gamma_init,
         "entropy_weight": args.entropy_weight,
         "epochs": args.epochs,
         "n_pred_clusters": int(len(np.unique(assignments))),
     }
     write_metrics(f"{out_prefix}_metrics.json", metrics)
-    print(f"Saved {out_prefix}_* ; val_ll={val_ll:.6f}")
+    print(f"Saved {out_prefix}_* ; val_ll={val_ll:.6f} gamma={gamma:.4f}")
     return metrics
 
 
@@ -377,11 +427,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--out-prefix", default="gnn")
     p.add_argument("--k", type=int, default=729)
     p.add_argument("--d", type=int, default=32)
-    p.add_argument("--layers", type=int, default=2)
+    p.add_argument("--layers", type=int, default=2, help="GNN depth L; 0 = LV + JK(h0) only")
     p.add_argument("--minibatch", type=int, default=2500)
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--max-updates", type=int, default=None)
     p.add_argument("--lr", type=float, default=1e-2)
+    p.add_argument("--gamma-init", type=float, default=0.0, help="Init for residual GNN mix")
     p.add_argument("--entropy-weight", type=float, default=1.0)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--no-edge-mask", action="store_true")

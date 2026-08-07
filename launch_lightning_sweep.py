@@ -130,7 +130,7 @@ def main() -> None:
     parser.add_argument("--pca-lrs", type=float, nargs="+", default=[0.01])
     parser.add_argument("--lv-dims", type=int, nargs="+", default=[32, 64])
     parser.add_argument("--lv-lrs", type=float, nargs="+", default=[0.05, 0.1])
-    parser.add_argument("--gnn-layers", type=int, nargs="+", default=[1, 2])
+    parser.add_argument("--gnn-layers", type=int, nargs="+", default=[0, 1, 2, 4])
     parser.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
     parser.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
     parser.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2])
