@@ -221,6 +221,57 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                             ],
                         )
                     )
+
+    if "gnn_e" in methods:
+        for layers in args.gnn_e_layers:
+            for d in args.gnn_e_dims:
+                for d_e in args.gnn_e_d_es:
+                    for lr in args.gnn_e_lrs:
+                        for e_wd in args.gnn_e_wds:
+                            name = f"hp_gnn_e_L{layers}_d{d}_de{d_e}_lr{lr}_ewd{e_wd}"
+                            prefix = name
+                            specs.append(
+                                RunSpec(
+                                    name=name,
+                                    method="gnn_e",
+                                    prefix=prefix,
+                                    hyperparams={
+                                        "layers": layers,
+                                        "d": d,
+                                        "d_e": d_e,
+                                        "lr": lr,
+                                        "e_wd": e_wd,
+                                    },
+                                    command=[
+                                        py,
+                                        "gnn_e_vsbm.py",
+                                        "--k",
+                                        str(args.k),
+                                        "--d",
+                                        str(d),
+                                        "--d-e",
+                                        str(d_e),
+                                        "--e-wd",
+                                        str(e_wd),
+                                        "--layers",
+                                        str(layers),
+                                        "--lr",
+                                        str(lr),
+                                        "--epochs",
+                                        str(args.epochs),
+                                        "--minibatch",
+                                        str(args.minibatch),
+                                        "--seed",
+                                        str(args.split_seed),
+                                        "--device",
+                                        args.device,
+                                        "--heldout-pairs",
+                                        args.heldout_pairs,
+                                        "--out-prefix",
+                                        prefix,
+                                    ],
+                                )
+                            )
     return specs
 
 
@@ -278,8 +329,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                 ]
             elif method == "lv_e":
                 name = (
-                    f"final_lv_e_d{hp['d']}_de{hp['d_e']}_lr{hp['lr']}_"
-                    f"ewd{hp['e_wd']}_seed{seed}"
+                    f"final_lv_e_d{hp['d']}_de{hp['d_e']}_lr{hp['lr']}_ewd{hp['e_wd']}_seed{seed}"
                 )
                 cmd = [
                     py,
@@ -307,7 +357,40 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     "--out-prefix",
                     name,
                 ]
-            else:
+            elif method == "gnn_e":
+                name = (
+                    f"final_gnn_e_L{hp['layers']}_d{hp['d']}_de{hp['d_e']}_"
+                    f"lr{hp['lr']}_ewd{hp['e_wd']}_seed{seed}"
+                )
+                cmd = [
+                    py,
+                    "gnn_e_vsbm.py",
+                    "--k",
+                    str(args.k),
+                    "--d",
+                    str(hp["d"]),
+                    "--d-e",
+                    str(hp["d_e"]),
+                    "--e-wd",
+                    str(hp["e_wd"]),
+                    "--layers",
+                    str(hp["layers"]),
+                    "--lr",
+                    str(hp["lr"]),
+                    "--epochs",
+                    str(args.final_epochs),
+                    "--minibatch",
+                    str(args.minibatch),
+                    "--seed",
+                    str(seed),
+                    "--device",
+                    args.device,
+                    "--heldout-pairs",
+                    args.heldout_pairs,
+                    "--out-prefix",
+                    name,
+                ]
+            elif method == "gnn":
                 name = f"final_gnn_L{hp['layers']}_d{hp['d']}_lr{hp['lr']}_seed{seed}"
                 cmd = [
                     py,
@@ -333,6 +416,8 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     "--out-prefix",
                     name,
                 ]
+            else:
+                raise ValueError(f"Unknown method for finals: {method}")
             specs.append(
                 RunSpec(
                     name=name,
@@ -398,12 +483,17 @@ def main() -> None:
     p.add_argument("--gnn-layers", type=int, nargs="+", default=[0, 1, 2, 4])
     p.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
     p.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
+    p.add_argument("--gnn-e-layers", type=int, nargs="+", default=[0, 1, 2])
+    p.add_argument("--gnn-e-dims", type=int, nargs="+", default=[32, 64])
+    p.add_argument("--gnn-e-d-es", type=int, nargs="+", default=[16])
+    p.add_argument("--gnn-e-lrs", type=float, nargs="+", default=[0.005, 0.01])
+    p.add_argument("--gnn-e-wds", type=float, nargs="+", default=[1e-2])
     p.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument(
         "--methods",
         nargs="+",
-        default=["pca", "lv", "lv_e", "gnn"],
-        choices=["pca", "lv", "lv_e", "gnn"],
+        default=["pca", "lv", "lv_e", "gnn", "gnn_e"],
+        choices=["pca", "lv", "lv_e", "gnn", "gnn_e"],
         help="Which methods to include in HP search / finals",
     )
     p.add_argument("--skip-existing", action="store_true")
@@ -452,6 +542,10 @@ def main() -> None:
             if method == "gnn":
                 hp["layers"] = int(best["layers"])
             if method == "lv_e":
+                hp["d_e"] = int(best["d_e"])
+                hp["e_wd"] = float(best["e_wd"])
+            if method == "gnn_e":
+                hp["layers"] = int(best["layers"])
                 hp["d_e"] = int(best["d_e"])
                 hp["e_wd"] = float(best["e_wd"])
             best_by_method[method] = {

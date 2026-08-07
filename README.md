@@ -62,6 +62,28 @@ Smoke:
 uv run python train_lv_e.py --epochs 1 --max-updates 5 --minibatch 1024 --seed 0
 ```
 
+### GNN$_e$-vSBM (multi-hop residual over $e_i$)
+
+Implemented in [`gnn_e_vsbm.py`](gnn_e_vsbm.py). LV bilinear backbone is unchanged;
+the directed GNN now message-passes **node residuals** $e_i$ rather than cluster
+features $\alpha U$:
+
+$$
+\mathrm{logit}_{ij}
+=
+(\alpha_i U_s)\cdot(\alpha_j U_t)+b
++\gamma\,(h_i^{\mathrm{src}}\cdot h_j^{\mathrm{tgt}}),
+\qquad
+h^{(0)}=e.
+$$
+
+Jumping Knowledge and residual $\gamma$ (init $0$) match the GNN-vSBM design.
+Weight decay applies only to raw $e$.
+
+```bash
+uv run python gnn_e_vsbm.py --epochs 1 --max-updates 5 --layers 2 --seed 0
+```
+
 ### GNN-vSBM (multi-hop residual)
 
 Implemented in [`gnn_vsbm.py`](gnn_vsbm.py). Soft assignments feed a **low-rank LV
@@ -110,23 +132,24 @@ Ground-truth visual types are **not** used for hyperparameter selection. Selecti
 held-out unsupervised metrics only ([`heldout.py`](heldout.py)):
 
 1. **Fixed splits** (shared across methods; `split_seed=0` by default):
-   - LV / LV+$e$ / GNN: ~50k held-out positive directed edges + 50k negatives. Held-out
-     positives are removed from the GNN message-passing graph and excluded from the
-     training LL.
+   - LV / LV+$e$ / GNN / GNN$_e$: ~50k held-out positive directed edges + 50k negatives.
+     Held-out positives are removed from the GNN message-passing graph and excluded
+     from the training LL.
    - PCA: ~10% of rows held out for reconstruction scoring.
 2. **Phase 1 — HP search:** each method sweeps its own grid; pick the setting that
-   maximizes held-out Bernoulli log-likelihood (LV / LV+$e$ / GNN) or minimizes
-   held-out row MSE (PCA; stored as negated MSE so higher is always better).
+   maximizes held-out Bernoulli log-likelihood (LV / LV+$e$ / GNN / GNN$_e$) or
+   minimizes held-out row MSE (PCA; stored as negated MSE so higher is always better).
 3. **Phase 2 — multi-seed finals:** retrain the selected setting with several seeds
    (default `0,1,2`). Report Hungarian / ARI / NMI vs visual types as mean ± std.
 
 Orchestration: [`run_experiments.py`](run_experiments.py). Outputs:
 `hp_results.*`, `hp_best.json`, `final_results.*`, `final_summary.*`.
-Select methods with `--methods` (e.g. `pca lv lv_e` to skip GNN).
+Select methods with `--methods` (e.g. `pca lv lv_e gnn_e`).
 
 Lean LV+$e$ HP grid: $d\in\{32,64\}$, $d_e\in\{16,32\}$, $\mathrm{lr}\in\{0.05,0.1\}$,
-$e_{\mathrm{wd}}\in\{10^{-3},10^{-2}\}$. Optional GNN grid: $L\in\{0,1,2,4\}$,
-$d\in\{32,64\}$, $\mathrm{lr}\in\{0.005,0.01\}$.
+$e_{\mathrm{wd}}\in\{10^{-3},10^{-2}\}$. Lean GNN$_e$ grid: $L\in\{0,1,2\}$,
+$d\in\{32,64\}$, $d_e{=}16$, $\mathrm{lr}\in\{0.005,0.01\}$, $e_{\mathrm{wd}}{=}10^{-2}$.
+Optional α-GNN grid: $L\in\{0,1,2,4\}$, $d\in\{32,64\}$, $\mathrm{lr}\in\{0.005,0.01\}$.
 
 
 ## End-to-end workflow
@@ -190,7 +213,7 @@ uv pip install lightning-sdk
 
 uv run python launch_lightning_sweep.py \
   --machine L4 \
-  --methods pca lv lv_e \
+  --methods pca lv lv_e gnn_e \
   --detach-only \
   --remote-stop-after
 ```

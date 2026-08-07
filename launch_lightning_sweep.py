@@ -28,6 +28,7 @@ REMOTE_PID = "unsup_sweep.pid"
 
 CODE_FILES = [
     "gnn_vsbm.py",
+    "gnn_e_vsbm.py",
     "train_lv_vsbm.py",
     "train_lv_e.py",
     "train_pca_baseline.py",
@@ -138,13 +139,18 @@ def main() -> None:
     parser.add_argument("--gnn-layers", type=int, nargs="+", default=[0, 1, 2, 4])
     parser.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
     parser.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
+    parser.add_argument("--gnn-e-layers", type=int, nargs="+", default=[0, 1, 2])
+    parser.add_argument("--gnn-e-dims", type=int, nargs="+", default=[32, 64])
+    parser.add_argument("--gnn-e-d-es", type=int, nargs="+", default=[16])
+    parser.add_argument("--gnn-e-lrs", type=float, nargs="+", default=[0.005, 0.01])
+    parser.add_argument("--gnn-e-wds", type=float, nargs="+", default=[1e-2])
     parser.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=["pca", "lv", "lv_e"],
-        choices=["pca", "lv", "lv_e", "gnn"],
-        help="Methods to sweep (default: pca lv lv_e; omit gnn)",
+        default=["pca", "lv", "lv_e", "gnn_e"],
+        choices=["pca", "lv", "lv_e", "gnn", "gnn_e"],
+        help="Methods to sweep (default: pca lv lv_e gnn_e)",
     )
     parser.add_argument("--phase", choices=["all", "hp", "final"], default="all")
     parser.add_argument("--skip-upload", action="store_true")
@@ -219,7 +225,13 @@ def main() -> None:
             f"--lv-e-lrs {join_nums(args.lv_e_lrs)} "
             f"--lv-e-wds {join_nums(args.lv_e_wds)} "
             f"--gnn-layers {join_nums(args.gnn_layers)} --gnn-dims {join_nums(args.gnn_dims)} "
-            f"--gnn-lrs {join_nums(args.gnn_lrs)} --final-seeds {join_nums(args.final_seeds)}"
+            f"--gnn-lrs {join_nums(args.gnn_lrs)} "
+            f"--gnn-e-layers {join_nums(args.gnn_e_layers)} "
+            f"--gnn-e-dims {join_nums(args.gnn_e_dims)} "
+            f"--gnn-e-d-es {join_nums(args.gnn_e_d_es)} "
+            f"--gnn-e-lrs {join_nums(args.gnn_e_lrs)} "
+            f"--gnn-e-wds {join_nums(args.gnn_e_wds)} "
+            f"--final-seeds {join_nums(args.final_seeds)}"
         )
         if args.skip_existing:
             sweep_args += " --skip-existing"
