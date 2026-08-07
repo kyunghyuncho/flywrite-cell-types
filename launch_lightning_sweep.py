@@ -29,6 +29,7 @@ REMOTE_PID = "unsup_sweep.pid"
 CODE_FILES = [
     "gnn_vsbm.py",
     "train_lv_vsbm.py",
+    "train_lv_e.py",
     "train_pca_baseline.py",
     "sparse_graph_pca.py",
     "heldout.py",
@@ -130,10 +131,21 @@ def main() -> None:
     parser.add_argument("--pca-lrs", type=float, nargs="+", default=[0.01])
     parser.add_argument("--lv-dims", type=int, nargs="+", default=[32, 64])
     parser.add_argument("--lv-lrs", type=float, nargs="+", default=[0.05, 0.1])
+    parser.add_argument("--lv-e-dims", type=int, nargs="+", default=[32, 64])
+    parser.add_argument("--lv-e-d-es", type=int, nargs="+", default=[16, 32])
+    parser.add_argument("--lv-e-lrs", type=float, nargs="+", default=[0.05, 0.1])
+    parser.add_argument("--lv-e-wds", type=float, nargs="+", default=[1e-3, 1e-2])
     parser.add_argument("--gnn-layers", type=int, nargs="+", default=[0, 1, 2, 4])
     parser.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
     parser.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
     parser.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2])
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        default=["pca", "lv", "lv_e"],
+        choices=["pca", "lv", "lv_e", "gnn"],
+        help="Methods to sweep (default: pca lv lv_e; omit gnn)",
+    )
     parser.add_argument("--phase", choices=["all", "hp", "final"], default="all")
     parser.add_argument("--skip-upload", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
@@ -191,8 +203,10 @@ def main() -> None:
         def join_nums(vals: list) -> str:
             return " ".join(str(x) for x in vals)
 
+        methods = " ".join(args.methods)
         sweep_args = (
             f"--device cuda --phase {args.phase} "
+            f"--methods {methods} "
             f"--split-seed {args.split_seed} "
             f"--epochs {args.epochs} --final-epochs {args.final_epochs} "
             f"--minibatch {args.minibatch} "
@@ -200,6 +214,10 @@ def main() -> None:
             f"--final-pca-max-iter {args.final_pca_max_iter} "
             f"--pca-dims {join_nums(args.pca_dims)} --pca-lrs {join_nums(args.pca_lrs)} "
             f"--lv-dims {join_nums(args.lv_dims)} --lv-lrs {join_nums(args.lv_lrs)} "
+            f"--lv-e-dims {join_nums(args.lv_e_dims)} "
+            f"--lv-e-d-es {join_nums(args.lv_e_d_es)} "
+            f"--lv-e-lrs {join_nums(args.lv_e_lrs)} "
+            f"--lv-e-wds {join_nums(args.lv_e_wds)} "
             f"--gnn-layers {join_nums(args.gnn_layers)} --gnn-dims {join_nums(args.gnn_dims)} "
             f"--gnn-lrs {join_nums(args.gnn_lrs)} --final-seeds {join_nums(args.final_seeds)}"
         )

@@ -69,95 +69,60 @@ def ensure_heldout(args: argparse.Namespace) -> None:
 def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
     py = sys.executable
     specs: list[RunSpec] = []
+    methods = set(args.methods)
 
-    for d in args.pca_dims:
-        for lr in args.pca_lrs:
-            name = f"hp_pca_d{d}_lr{lr}"
-            prefix = name
-            specs.append(
-                RunSpec(
-                    name=name,
-                    method="pca",
-                    prefix=prefix,
-                    hyperparams={"d": d, "lr": lr},
-                    command=[
-                        py,
-                        "train_pca_baseline.py",
-                        "--k",
-                        str(args.k),
-                        "--d",
-                        str(d),
-                        "--lr",
-                        str(lr),
-                        "--max-iter",
-                        str(args.pca_max_iter),
-                        "--seed",
-                        str(args.split_seed),
-                        "--device",
-                        args.device,
-                        "--heldout-rows",
-                        args.heldout_rows,
-                        "--out-prefix",
-                        prefix,
-                    ],
-                )
-            )
-
-    for d in args.lv_dims:
-        for lr in args.lv_lrs:
-            name = f"hp_lv_d{d}_lr{lr}"
-            prefix = name
-            specs.append(
-                RunSpec(
-                    name=name,
-                    method="lv",
-                    prefix=prefix,
-                    hyperparams={"d": d, "lr": lr},
-                    command=[
-                        py,
-                        "train_lv_vsbm.py",
-                        "--k",
-                        str(args.k),
-                        "--d",
-                        str(d),
-                        "--lr",
-                        str(lr),
-                        "--epochs",
-                        str(args.epochs),
-                        "--minibatch",
-                        str(args.minibatch),
-                        "--seed",
-                        str(args.split_seed),
-                        "--device",
-                        args.device,
-                        "--heldout-pairs",
-                        args.heldout_pairs,
-                        "--out-prefix",
-                        prefix,
-                    ],
-                )
-            )
-
-    for layers in args.gnn_layers:
-        for d in args.gnn_dims:
-            for lr in args.gnn_lrs:
-                name = f"hp_gnn_L{layers}_d{d}_lr{lr}"
+    if "pca" in methods:
+        for d in args.pca_dims:
+            for lr in args.pca_lrs:
+                name = f"hp_pca_d{d}_lr{lr}"
                 prefix = name
                 specs.append(
                     RunSpec(
                         name=name,
-                        method="gnn",
+                        method="pca",
                         prefix=prefix,
-                        hyperparams={"layers": layers, "d": d, "lr": lr},
+                        hyperparams={"d": d, "lr": lr},
                         command=[
                             py,
-                            "gnn_vsbm.py",
+                            "train_pca_baseline.py",
                             "--k",
                             str(args.k),
                             "--d",
                             str(d),
-                            "--layers",
-                            str(layers),
+                            "--lr",
+                            str(lr),
+                            "--max-iter",
+                            str(args.pca_max_iter),
+                            "--seed",
+                            str(args.split_seed),
+                            "--device",
+                            args.device,
+                            "--heldout-rows",
+                            args.heldout_rows,
+                            "--out-prefix",
+                            prefix,
+                        ],
+                    )
+                )
+
+    if "lv" in methods:
+        for d in args.lv_dims:
+            for lr in args.lv_lrs:
+                name = f"hp_lv_d{d}_lr{lr}"
+                prefix = name
+                specs.append(
+                    RunSpec(
+                        name=name,
+                        method="lv",
+                        prefix=prefix,
+                        hyperparams={"d": d, "lr": lr},
+                        command=[
+                            py,
+                            "train_lv_vsbm.py",
+                            "--k",
+                            str(args.k),
+                            "--d",
+                            str(d),
                             "--lr",
                             str(lr),
                             "--epochs",
@@ -175,6 +140,87 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         ],
                     )
                 )
+
+    if "lv_e" in methods:
+        for d in args.lv_e_dims:
+            for d_e in args.lv_e_d_es:
+                for lr in args.lv_e_lrs:
+                    for e_wd in args.lv_e_wds:
+                        name = f"hp_lv_e_d{d}_de{d_e}_lr{lr}_ewd{e_wd}"
+                        prefix = name
+                        specs.append(
+                            RunSpec(
+                                name=name,
+                                method="lv_e",
+                                prefix=prefix,
+                                hyperparams={"d": d, "d_e": d_e, "lr": lr, "e_wd": e_wd},
+                                command=[
+                                    py,
+                                    "train_lv_e.py",
+                                    "--k",
+                                    str(args.k),
+                                    "--d",
+                                    str(d),
+                                    "--d-e",
+                                    str(d_e),
+                                    "--e-wd",
+                                    str(e_wd),
+                                    "--lr",
+                                    str(lr),
+                                    "--epochs",
+                                    str(args.epochs),
+                                    "--minibatch",
+                                    str(args.minibatch),
+                                    "--seed",
+                                    str(args.split_seed),
+                                    "--device",
+                                    args.device,
+                                    "--heldout-pairs",
+                                    args.heldout_pairs,
+                                    "--out-prefix",
+                                    prefix,
+                                ],
+                            )
+                        )
+
+    if "gnn" in methods:
+        for layers in args.gnn_layers:
+            for d in args.gnn_dims:
+                for lr in args.gnn_lrs:
+                    name = f"hp_gnn_L{layers}_d{d}_lr{lr}"
+                    prefix = name
+                    specs.append(
+                        RunSpec(
+                            name=name,
+                            method="gnn",
+                            prefix=prefix,
+                            hyperparams={"layers": layers, "d": d, "lr": lr},
+                            command=[
+                                py,
+                                "gnn_vsbm.py",
+                                "--k",
+                                str(args.k),
+                                "--d",
+                                str(d),
+                                "--layers",
+                                str(layers),
+                                "--lr",
+                                str(lr),
+                                "--epochs",
+                                str(args.epochs),
+                                "--minibatch",
+                                str(args.minibatch),
+                                "--seed",
+                                str(args.split_seed),
+                                "--device",
+                                args.device,
+                                "--heldout-pairs",
+                                args.heldout_pairs,
+                                "--out-prefix",
+                                prefix,
+                            ],
+                        )
+                    )
     return specs
 
 
@@ -215,6 +261,37 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     str(args.k),
                     "--d",
                     str(hp["d"]),
+                    "--lr",
+                    str(hp["lr"]),
+                    "--epochs",
+                    str(args.final_epochs),
+                    "--minibatch",
+                    str(args.minibatch),
+                    "--seed",
+                    str(seed),
+                    "--device",
+                    args.device,
+                    "--heldout-pairs",
+                    args.heldout_pairs,
+                    "--out-prefix",
+                    name,
+                ]
+            elif method == "lv_e":
+                name = (
+                    f"final_lv_e_d{hp['d']}_de{hp['d_e']}_lr{hp['lr']}_"
+                    f"ewd{hp['e_wd']}_seed{seed}"
+                )
+                cmd = [
+                    py,
+                    "train_lv_e.py",
+                    "--k",
+                    str(args.k),
+                    "--d",
+                    str(hp["d"]),
+                    "--d-e",
+                    str(hp["d_e"]),
+                    "--e-wd",
+                    str(hp["e_wd"]),
                     "--lr",
                     str(hp["lr"]),
                     "--epochs",
@@ -314,10 +391,21 @@ def main() -> None:
     p.add_argument("--pca-lrs", type=float, nargs="+", default=[0.01])
     p.add_argument("--lv-dims", type=int, nargs="+", default=[32, 64])
     p.add_argument("--lv-lrs", type=float, nargs="+", default=[0.05, 0.1])
+    p.add_argument("--lv-e-dims", type=int, nargs="+", default=[32, 64])
+    p.add_argument("--lv-e-d-es", type=int, nargs="+", default=[16, 32])
+    p.add_argument("--lv-e-lrs", type=float, nargs="+", default=[0.05, 0.1])
+    p.add_argument("--lv-e-wds", type=float, nargs="+", default=[1e-3, 1e-2])
     p.add_argument("--gnn-layers", type=int, nargs="+", default=[0, 1, 2, 4])
     p.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
     p.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
     p.add_argument("--final-seeds", type=int, nargs="+", default=[0, 1, 2])
+    p.add_argument(
+        "--methods",
+        nargs="+",
+        default=["pca", "lv", "lv_e", "gnn"],
+        choices=["pca", "lv", "lv_e", "gnn"],
+        help="Which methods to include in HP search / finals",
+    )
     p.add_argument("--skip-existing", action="store_true")
     p.add_argument("--phase", choices=["all", "hp", "final"], default="all")
     args = p.parse_args()
@@ -355,7 +443,7 @@ def main() -> None:
                 f"gt_hungarian={row['gt_hungarian']:.1f}"
             )
 
-        for method in ("pca", "lv", "gnn"):
+        for method in args.methods:
             cand = [r for r in hp_rows if r["method"] == method]
             if not cand:
                 continue
@@ -363,6 +451,9 @@ def main() -> None:
             hp = {"d": int(best["d"]), "lr": float(best["lr"])}
             if method == "gnn":
                 hp["layers"] = int(best["layers"])
+            if method == "lv_e":
+                hp["d_e"] = int(best["d_e"])
+                hp["e_wd"] = float(best["e_wd"])
             best_by_method[method] = {
                 "name": best["name"],
                 "val_metric": best["val_metric"],
