@@ -158,6 +158,11 @@ def main() -> None:
     parser.add_argument("--gnn-layers", type=int, nargs="+", default=[0, 1, 2, 4])
     parser.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
     parser.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
+    parser.add_argument("--gnn-bfs-fracs", type=float, nargs="+", default=[1.0])
+    parser.add_argument(
+        "--gnn-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson", "nb"]
+    )
+    parser.add_argument("--gnn-propagation", choices=["subgraph", "full"], default="subgraph")
     parser.add_argument("--gnn-e-layers", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--gnn-e-dims", type=int, nargs="+", default=[32, 64])
     parser.add_argument("--gnn-e-d-es", type=int, nargs="+", default=[16])
@@ -270,6 +275,9 @@ def main() -> None:
             f"--lv-control-updates {args.lv_control_updates} "
             f"--gnn-layers {join_nums(args.gnn_layers)} --gnn-dims {join_nums(args.gnn_dims)} "
             f"--gnn-lrs {join_nums(args.gnn_lrs)} "
+            f"--gnn-bfs-fracs {join_nums(args.gnn_bfs_fracs)} "
+            f"--gnn-likelihoods {join_nums(args.gnn_likelihoods)} "
+            f"--gnn-propagation {args.gnn_propagation} "
             f"--gnn-e-layers {join_nums(args.gnn_e_layers)} "
             f"--gnn-e-dims {join_nums(args.gnn_e_dims)} "
             f"--gnn-e-d-es {join_nums(args.gnn_e_d_es)} "

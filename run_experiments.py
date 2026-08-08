@@ -274,40 +274,56 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
         for layers in args.gnn_layers:
             for d in args.gnn_dims:
                 for lr in args.gnn_lrs:
-                    name = f"hp_gnn_L{layers}_d{d}_lr{lr}"
-                    prefix = name
-                    specs.append(
-                        RunSpec(
-                            name=name,
-                            method="gnn",
-                            prefix=prefix,
-                            hyperparams={"layers": layers, "d": d, "lr": lr},
-                            command=[
-                                py,
-                                "gnn_vsbm.py",
-                                "--k",
-                                str(args.k),
-                                "--d",
-                                str(d),
-                                "--layers",
-                                str(layers),
-                                "--lr",
-                                str(lr),
-                                "--epochs",
-                                str(args.epochs),
-                                "--minibatch",
-                                str(args.minibatch),
-                                "--seed",
-                                str(args.split_seed),
-                                "--device",
-                                args.device,
-                                "--heldout-pairs",
-                                args.heldout_pairs,
-                                "--out-prefix",
-                                prefix,
-                            ],
-                        )
-                    )
+                    for bfs_frac in args.gnn_bfs_fracs:
+                        for likelihood in args.gnn_likelihoods:
+                            name = f"hp_gnn_L{layers}_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}"
+                            prefix = name
+                            specs.append(
+                                RunSpec(
+                                    name=name,
+                                    method="gnn",
+                                    prefix=prefix,
+                                    hyperparams={
+                                        "layers": layers,
+                                        "d": d,
+                                        "lr": lr,
+                                        "bfs_frac": bfs_frac,
+                                        "likelihood": likelihood,
+                                    },
+                                    command=[
+                                        py,
+                                        "gnn_vsbm.py",
+                                        "--k",
+                                        str(args.k),
+                                        "--d",
+                                        str(d),
+                                        "--layers",
+                                        str(layers),
+                                        "--lr",
+                                        str(lr),
+                                        "--bfs-frac",
+                                        str(bfs_frac),
+                                        "--bfs-seeds",
+                                        str(args.bfs_seeds),
+                                        "--likelihood",
+                                        likelihood,
+                                        "--propagation",
+                                        args.gnn_propagation,
+                                        "--epochs",
+                                        str(args.epochs),
+                                        "--minibatch",
+                                        str(args.minibatch),
+                                        "--seed",
+                                        str(args.split_seed),
+                                        "--device",
+                                        args.device,
+                                        "--heldout-pairs",
+                                        args.heldout_pairs,
+                                        "--out-prefix",
+                                        prefix,
+                                    ],
+                                )
+                            )
 
     if "gnn_e" in methods:
         for layers in args.gnn_e_layers:
@@ -534,7 +550,10 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     name,
                 ]
             elif method == "gnn":
-                name = f"final_gnn_L{hp['layers']}_d{hp['d']}_lr{hp['lr']}_seed{seed}"
+                name = (
+                    f"final_gnn_L{hp['layers']}_d{hp['d']}_lr{hp['lr']}_"
+                    f"bfs{hp['bfs_frac']}_{hp['likelihood']}_seed{seed}"
+                )
                 cmd = [
                     py,
                     "gnn_vsbm.py",
@@ -546,6 +565,14 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     str(hp["layers"]),
                     "--lr",
                     str(hp["lr"]),
+                    "--bfs-frac",
+                    str(hp["bfs_frac"]),
+                    "--bfs-seeds",
+                    str(args.bfs_seeds),
+                    "--likelihood",
+                    str(hp["likelihood"]),
+                    "--propagation",
+                    str(hp.get("propagation", args.gnn_propagation)),
                     "--epochs",
                     str(args.final_epochs),
                     "--minibatch",
@@ -653,7 +680,7 @@ def main() -> None:
         "--lv-e-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson"]
     )
     p.add_argument(
-        "--bfs-seeds", type=int, default=4, help="BFS seeds per expansion round (LV / LV+e)"
+        "--bfs-seeds", type=int, default=4, help="BFS seeds per expansion round (LV / LV+e / GNN)"
     )
     p.add_argument(
         "--lv-control-updates",
@@ -667,6 +694,20 @@ def main() -> None:
     p.add_argument("--gnn-layers", type=int, nargs="+", default=[0, 1, 2, 4])
     p.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
     p.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
+    p.add_argument("--gnn-bfs-fracs", type=float, nargs="+", default=[1.0])
+    p.add_argument(
+        "--gnn-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson", "nb"]
+    )
+    p.add_argument(
+        "--gnn-propagation",
+        choices=["subgraph", "full"],
+        default="subgraph",
+        help=(
+            "Training-time GNN message passing. 'subgraph' (default) propagates over "
+            "the sampled block only; 'full' propagates over all nodes each step and "
+            "costs several times more per update"
+        ),
+    )
     p.add_argument("--gnn-e-layers", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--gnn-e-dims", type=int, nargs="+", default=[32, 64])
     p.add_argument("--gnn-e-d-es", type=int, nargs="+", default=[16])
@@ -730,7 +771,8 @@ def main() -> None:
             hp = {"d": int(best["d"]), "lr": float(best["lr"])}
             if method == "gnn":
                 hp["layers"] = int(best["layers"])
-            if method in {"lv", "lv_e"}:
+                hp["propagation"] = args.gnn_propagation
+            if method in {"lv", "lv_e", "gnn"}:
                 hp["bfs_frac"] = float(best["bfs_frac"])
                 hp["likelihood"] = str(best["likelihood"])
             if method == "lv" and best.get("target_updates"):
