@@ -158,10 +158,11 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
         # A coverage-defined epoch is longer at higher bfs_frac, so the epoch-matched
         # grid above also hands the BFS arms more gradient steps. This control gives
         # uniform sampling the same update budget, separating the two effects.
-        for d in args.lv_dims:
+        # One dim and one likelihood suffice: the control isolates the sampler, not
+        # the rank or the observation model, and each control costs as much as a
+        # BFS run.
+        for d in args.lv_dims[:1]:
             for lr in args.lv_lrs:
-                # One likelihood suffices: the control isolates the sampler, not the
-                # observation model, and each control costs as much as a BFS run.
                 for likelihood in args.lv_likelihoods[:1]:
                     name = f"hp_lv_control_d{d}_lr{lr}_{likelihood}"
                     specs.append(
@@ -637,17 +638,17 @@ def main() -> None:
     p.add_argument("--row-holdout", type=float, default=0.1)
     p.add_argument("--pca-dims", type=int, nargs="+", default=[32, 64])
     p.add_argument("--pca-lrs", type=float, nargs="+", default=[0.01])
-    p.add_argument("--lv-dims", type=int, nargs="+", default=[64])
+    p.add_argument("--lv-dims", type=int, nargs="+", default=[64, 128, 256])
     p.add_argument("--lv-lrs", type=float, nargs="+", default=[0.1])
-    p.add_argument("--lv-bfs-fracs", type=float, nargs="+", default=[0.0, 0.5, 1.0])
+    p.add_argument("--lv-bfs-fracs", type=float, nargs="+", default=[1.0])
     p.add_argument(
         "--lv-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson", "nb"]
     )
-    p.add_argument("--lv-e-dims", type=int, nargs="+", default=[64])
+    p.add_argument("--lv-e-dims", type=int, nargs="+", default=[64, 128])
     p.add_argument("--lv-e-d-es", type=int, nargs="+", default=[16])
     p.add_argument("--lv-e-lrs", type=float, nargs="+", default=[0.05])
     p.add_argument("--lv-e-wds", type=float, nargs="+", default=[1e-2])
-    p.add_argument("--lv-e-bfs-fracs", type=float, nargs="+", default=[0.5])
+    p.add_argument("--lv-e-bfs-fracs", type=float, nargs="+", default=[1.0])
     p.add_argument(
         "--lv-e-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson"]
     )
@@ -732,6 +733,10 @@ def main() -> None:
             if method in {"lv", "lv_e"}:
                 hp["bfs_frac"] = float(best["bfs_frac"])
                 hp["likelihood"] = str(best["likelihood"])
+            if method == "lv" and best.get("target_updates"):
+                # Carry the matched-compute budget so a selected control stays a
+                # control in the finals instead of reverting to epoch matching.
+                hp["target_updates"] = int(best["target_updates"])
             if method == "lv_e":
                 hp["d_e"] = int(best["d_e"])
                 hp["e_wd"] = float(best["e_wd"])

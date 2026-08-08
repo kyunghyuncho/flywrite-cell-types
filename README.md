@@ -66,7 +66,9 @@ denser than the graph, which inflates the learned base rate $b$ and destroys
 calibration against the held-out pairs. Each batch therefore mixes a
 `--bfs-frac` fraction of BFS-grown nodes with a uniformly sampled remainder:
 $0$ recovers the previous uniform sampling, $1$ gives a pure neighbourhood
-subgraph, default $0.5$. This is the primary quantity to sweep.
+subgraph, trainer default $0.5$. In the pilot the mixing was monotone in the
+wrong direction for calibration but the right one for recovery, and $1$ won
+outright, so the sweep pins it there rather than spending a grid axis on it.
 
 Note that the held-out Bernoulli log-likelihood does **not** arbitrate this on its
 own. The held-out set is balanced ($50$k positives, $50$k negatives) while the
@@ -268,18 +270,30 @@ Orchestration: [`run_experiments.py`](run_experiments.py). Outputs:
 `hp_results.*`, `hp_best.json`, `final_results.*`, `final_summary.*`.
 Select methods with `--methods` (e.g. `lv lv_e ntac`).
 
-Current LV grids fix the architecture at the previously selected optimum and
-spend the budget on the sampler and the likelihood instead:
+Current LV grids fix the learning rate at the previously selected optimum and
+spend the budget on the likelihood and the rank $d$. A pilot at $5$ epochs
+established that `bfs_frac` is not worth a grid axis — Hungarian $1\,228$ at $0$,
+$1\,644$ at $0.5$, $4\,641$ at $1$ — so the sampler is pinned at
+`bfs_frac`$=1$ and $d$ is swept instead, on the reasoning that once data exposure
+is no longer binding the rank bottleneck ($d=64$ describing $729$ types) becomes
+the next constraint. Sweeping $d$ is nearly free because the $K\times K$ term
+dominates at fixed $K=729$.
 
-* **LV** (`--lv-dims 64 --lv-lrs 0.1`): `--lv-bfs-fracs 0.0 0.5 1.0` $\times$
-  `--lv-likelihoods bernoulli poisson nb` — $9$ runs. The `bfs_frac`$=0$ /
-  `bernoulli` cell is the control that reproduces the previous configuration.
-* **LV+$e$** (`--lv-e-dims 64 --lv-e-d-es 16 --lv-e-lrs 0.05 --lv-e-wds 0.01`):
-  `--lv-e-bfs-fracs 0.5` $\times$ `--lv-e-likelihoods bernoulli poisson` — $2$
-  runs; the `bfs_frac` ablation is carried by the LV arm.
+* **LV** (`--lv-lrs 0.1 --lv-bfs-fracs 1.0`): `--lv-dims 64 128 256` $\times$
+  `--lv-likelihoods bernoulli poisson nb` — $9$ runs.
+* **Matched-compute control** (`--lv-control-updates N`, off by default): one
+  extra LV run at `bfs_frac`$=0$ with a total budget of $N$ updates, at the first
+  entry of `--lv-dims` and `--lv-likelihoods` only. It reproduces the previous
+  uniform-sampling configuration at the compute of a BFS arm; in the pilot it
+  reached $2\,257$ against $4\,641$, so the sampler helps beyond the extra
+  gradient steps.
+* **LV+$e$** (`--lv-e-d-es 16 --lv-e-lrs 0.05 --lv-e-wds 0.01
+  --lv-e-bfs-fracs 1.0`): `--lv-e-dims 64 128` $\times$
+  `--lv-e-likelihoods bernoulli poisson` — $4$ runs.
 
-That is $11$ HP runs plus $3\times2=6$ multi-seed finals. `--bfs-seeds`
-(default $4$) is shared and not swept. Lean GNN$_e$ grid: $L\in\{0,1,2\}$,
+That is $14$ HP runs with the control enabled, plus $3\times2=6$ multi-seed
+finals. `--bfs-seeds` (default $4$) is shared and not swept. Lean GNN$_e$ grid:
+$L\in\{0,1,2\}$,
 $d\in\{32,64\}$, $d_e{=}16$, $\mathrm{lr}\in\{0.005,0.01\}$, $e_{\mathrm{wd}}{=}10^{-2}$.
 NTAC defaults: $K{=}729$, $R{=}12$, $T{=}0.1$ (paper). Optional α-GNN grid:
 $L\in\{0,1,2,4\}$, $d\in\{32,64\}$, $\mathrm{lr}\in\{0.005,0.01\}$.

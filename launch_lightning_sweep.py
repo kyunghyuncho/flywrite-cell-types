@@ -134,17 +134,17 @@ def main() -> None:
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--pca-dims", type=int, nargs="+", default=[32, 64])
     parser.add_argument("--pca-lrs", type=float, nargs="+", default=[0.01])
-    parser.add_argument("--lv-dims", type=int, nargs="+", default=[64])
+    parser.add_argument("--lv-dims", type=int, nargs="+", default=[64, 128, 256])
     parser.add_argument("--lv-lrs", type=float, nargs="+", default=[0.1])
-    parser.add_argument("--lv-bfs-fracs", type=float, nargs="+", default=[0.0, 0.5, 1.0])
+    parser.add_argument("--lv-bfs-fracs", type=float, nargs="+", default=[1.0])
     parser.add_argument(
         "--lv-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson", "nb"]
     )
-    parser.add_argument("--lv-e-dims", type=int, nargs="+", default=[64])
+    parser.add_argument("--lv-e-dims", type=int, nargs="+", default=[64, 128])
     parser.add_argument("--lv-e-d-es", type=int, nargs="+", default=[16])
     parser.add_argument("--lv-e-lrs", type=float, nargs="+", default=[0.05])
     parser.add_argument("--lv-e-wds", type=float, nargs="+", default=[1e-2])
-    parser.add_argument("--lv-e-bfs-fracs", type=float, nargs="+", default=[0.5])
+    parser.add_argument("--lv-e-bfs-fracs", type=float, nargs="+", default=[1.0])
     parser.add_argument(
         "--lv-e-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson"]
     )
