@@ -558,24 +558,26 @@ sits at $\eta\approx-2.2$, i.e. $+6.6$ above $b$. Eight logits of travel span
 the range the data occupy while capping $|\eta|$ near $17$, two orders of
 magnitude below what the unconstrained decoder reached.
 
-**Does it keep $\mathrm{lr}=0.1$ trainable?** Three arms, identical
-configuration to the collapse above ($d=256$, $\mathrm{lr}=0.1$, Bernoulli,
-`bfs_frac`$=1$, seed $0$, $12$ epochs, $\epsilon=0$):
+**Does it keep $\mathrm{lr}=0.1$ trainable?** Four arms, identical configuration
+to the collapse above ($d=256$, $\mathrm{lr}=0.1$, Bernoulli, `bfs_frac`$=1$,
+seed $0$, $12$ epochs, $\epsilon=0$):
 
 | | $\max\lvert\eta\rvert$ by epoch | best LL / AUC | best Hungarian | last LL / AUC | last Hungarian |
 | --- | --- | --- | --- | --- | --- |
 | `none` | $15,\,125,\,1129,\,3030,\,3036\ldots$ | $-2.661$ / $0.770$ | $2\,599$ | $-6.486$ / $0.500$ | $1\,507$ |
 | `unit` `fixed` $8$ | $14.2$, then $10.5$–$12.5$ | $-2.061$ / $0.938$ | $10\,152$ | $-2.073$ / $0.942$ | $11\,126$ |
 | `unit` `learned` $8$ | $11.0$–$15.3$, no trend | $-2.115$ / $0.936$ | $10\,854$ | $-2.150$ / $0.940$ | $12\,027$ |
+| `unit` `per_row` $8$ | $11.0$ rising to $18$–$42$ | $-2.088$ / $0.942$ | $12\,039$ | $-2.089$ / $0.943$ | $12\,446$ |
 
 Yes — and not merely by avoiding divergence, which a model too weak to fit
-anything would also achieve. Both constrained arms improve monotonically to the
-end of the budget and are still improving at epoch $11$; AUC reaches $0.94$,
-past the $\approx0.9$ that $\mathrm{lr}=0.01$ bought at a tenth of the step
-size; and ground-truth agreement improves roughly fourfold over the control,
-from $2\,599$ to $10\,152$–$12\,027$ Hungarian. The bound is doing work rather
-than merely being satisfied: $\max|\eta|$ sits at $12$–$15$ against a ceiling of
-$b\pm8$, so the decoder is using most of its allowance.
+anything would also achieve. All three constrained arms improve monotonically to
+the end of the budget and are still improving at epoch $11$; AUC reaches
+$0.94$, past the $\approx0.9$ that $\mathrm{lr}=0.01$ bought at a tenth of the
+step size; and ground-truth agreement improves roughly fourfold over the
+control, from $2\,599$ to $10\,152$–$12\,446$ Hungarian. The bound is doing work
+rather than merely being satisfied: under `fixed` and `learned` the realised
+$\max|\eta|$ sits at $12$–$15$ against a ceiling of $b\pm8$, so the decoder
+spends most of its allowance.
 
 **The learned scale is stable.** It dips to $5.38$ in epoch $0$, then drifts up
 to $11.01$ by epoch $11$ — a factor of $1.4$ from its initialisation over a run
@@ -583,9 +585,21 @@ in which the unconstrained embeddings grew by a factor of $200$. It does not
 relocate the divergence. That it settles slightly above $8$ is mild evidence
 that $s_0=8$ is a reasonable, marginally conservative default.
 
+**`per_row` fits best and guarantees least, exactly as its bound predicts.** It
+takes the best numbers in the table, but its ceiling is $\max_k s_k$, and that
+maximum reaches $22.05$ while the mean scale is only $11.26$ — a factor of two
+of spread, bought by individual rows escaping. The consequence is visible in the
+diagnostic: $\max|\eta|$ is erratic and large ($26.7$, $42.1$, $29.0$, $26.0$
+over the last epochs) rather than sitting in a band, i.e. some entries are
+already in the regime where float32 $\sigma$ saturates, even though the run as a
+whole has not collapsed within twelve epochs. Its bias also drifts furthest from
+the base-rate logit, to $-5.21$. Twelve epochs of not-yet-diverging is not a
+guarantee; `fixed` has one by construction.
+
 **Selection now costs rather than saves.** Under normalisation the *last* epoch
 outscores the restored best-`val_ll` checkpoint on both AUC and Hungarian
-($11\,126$ against $10\,152$ fixed; $12\,027$ against $10\,854$ learned). The
+($11\,126$ against $10\,152$ fixed; $12\,027$ against $10\,854$ learned;
+$12\,446$ against $12\,039$ per-row). The
 best-checkpoint machinery exists to salvage diverged runs; on a training curve
 that no longer collapses it gives up a little agreement instead. This is the
 same `val_metric`-versus-Hungarian anti-correlation reported above, now visible
@@ -597,7 +611,8 @@ way to express. It does not grow pathologically. Under `none` it moves only from
 $-6.46$ to $-9.75$ *while the embeddings blow up by a factor of $200$* — even in
 the diverged run it stays within about a logit of
 $\log(1.5\times10^{-4})$, which localises the runaway entirely in $u^\top v$.
-Under `unit` it settles at $-7.27$ (fixed) and $-8.29$ (learned). `decoder_bias`
+Under `unit` it settles at $-7.27$ (fixed), $-8.29$ (learned) and $-5.21$
+(per-row, the one arm that drifts appreciably). `decoder_bias`
 and `last_decoder_bias` are recorded so this remains checkable rather than
 assumed; should a future run show the bias drifting, it is the next term to
 constrain.
@@ -627,8 +642,11 @@ and worth stating explicitly: `train_lv_e.py` adds $e_i\cdot e_j$ and
 learned scalar on every metric, has no parameter that can drift, and is the only
 arm whose ceiling is guaranteed for the whole run rather than merely observed
 after it. Use `learned` as the diagnostic that reports whether $s_0$ was badly
-chosen, and treat `per_row` as a last resort, since $\max_k s_k$ is a far weaker
-guarantee than a constant. Because normalisation, not smoothing, is what makes
+chosen. `per_row` is the strongest fit here and may be worth revisiting at
+longer budgets, but it should not be the default: its ceiling of $\max_k s_k$
+already ran to twice the mean within twelve epochs, which is the beginning of
+the behaviour the whole change exists to prevent. Because normalisation, not
+smoothing, is what makes
 $\mathrm{lr}=0.1$ trainable, the two axes should be swept in that order:
 
 ```bash
