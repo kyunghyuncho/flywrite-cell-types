@@ -456,6 +456,189 @@ Every run now records `label_smoothing`, `label_smoothing_target`,
 `label_smoothing_applied`, `train_base_rate` and `max_abs_train_logit`; the last
 is the direct observable for the hypothesis and is printed per epoch.
 
+#### The hypothesis is testable, and at $\mathrm{lr}=0.1$ it fails
+
+Five arms at the configuration that reliably collapses ($d=256$,
+$\mathrm{lr}=0.1$, `bfs_frac`$=1$, Bernoulli, seed $0$; $12$ epochs for
+$\epsilon\le10^{-2}$, $8$ for $\epsilon=10^{-1}$, $5$ for the `uniform` arm,
+which is enough — nothing survives past epoch $3$):
+
+| target | $\epsilon$ | best epoch | best LL / AUC | best Hungarian | last LL / AUC | last Hungarian | $\max\lvert\eta\rvert$ | ceiling |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| — | $0$ | $1$ | $-2.661$ / $0.770$ | $2\,599$ | $-6.486$ / $0.500$ | $1\,507$ | $3\,036$ | $\infty$ |
+| `base_rate` | $10^{-3}$ | $1$ | $-2.622$ / $0.759$ | $2\,379$ | $-6.486$ / $0.500$ | $1\,472$ | $2\,262$ | $6.91$ |
+| `base_rate` | $10^{-2}$ | $1$ | $-2.631$ / $0.771$ | $2\,655$ | $-6.486$ / $0.500$ | $1\,500$ | $2\,428$ | $4.60$ |
+| `base_rate` | $10^{-1}$ | $0$ | $-2.808$ / $0.682$ | $1\,891$ | $-6.478$ / $0.501$ | $1\,384$ | $1\,920$ | $2.20$ |
+| `uniform` | $10^{-2}$ | $1$ | $-2.209$ / $0.681$ | $1\,904$ | $-6.450$ / $0.454$ | $2\,030$ | $3\,363$ | $5.29$ |
+
+**Smoothing does not prevent the collapse.** Every arm peaks at epoch $1$ (epoch
+$0$ at $\epsilon=10^{-1}$), is at chance by epoch $2$–$3$, and lands on the same
+saturated $\approx-6.47$ / AUC $\approx0.5$ as the unsmoothed run. Larger
+$\epsilon$ makes it *worse*, not better: $\epsilon=10^{-1}$ collapses a full
+epoch earlier and loses $27\%$ of the best-checkpoint Hungarian. The tighter
+symmetric ceiling of the `uniform` arm buys one extra healthy epoch — it is the
+only arm still calibrated at epoch $2$ — and then goes the same way.
+
+The `max_abs_train_logit` column says why, and it is the useful part of the
+result. The per-epoch trajectory of $\max\lvert\eta\rvert$ at $\epsilon=10^{-2}$
+is $15.7 \to 95.3 \to 1\,139.6 \to 2\,428.0$, against a smoothed optimum of
+$4.60$. The decoder overshoots its own target by a factor of $\approx500$ within
+two epochs and never comes back. The mechanism in the hypothesis is real — with
+hard labels the optimum genuinely is at infinity — but it is not the binding
+constraint here, because the optimiser never approaches the optimum from below.
+This is consistent with the earlier clipping experiment: both interventions
+assume a decoder that is *walking* somewhere, whereas Adam at $\mathrm{lr}=0.1$
+with $d=256$ is *thrown* there. In the saturated regime the smoothed and hard
+gradients are numerically indistinguishable — for a non-edge at $\eta=+2\,000$
+the derivative is $\sigma(\eta)-\tilde y \approx 1$ either way — so a finite
+target cannot supply a restoring force that a hard target does not.
+
+**A second finding, unrelated to divergence.** The `uniform` arm exposes a trap
+in the selection metric, and it is the sharpest argument for `base_rate` in the
+whole section. The held-out split is balanced ($50\,000$ positives, $50\,000$
+negatives) while the graph is not, so a model that inflates its predicted base
+rate scores better on `val_metric` without ranking any better. At
+$\epsilon=10^{-2}$, `uniform` reports the **best held-out likelihood of any arm**
+($-2.209$ against `base_rate`'s $-2.631$) while being clearly the worse model on
+both quantities we actually care about: AUC $0.681$ against $0.771$, and
+Hungarian $1\,904$ against $2\,655$. Symmetric smoothing would therefore have
+been *selected* — a $29\%$ Hungarian loss bought by a regulariser that flatters
+the number we select by. That is on top of the marginal-preservation argument,
+and it is a standing reason to read `val_auc` next to `val_metric`.
+
+**Recommendation.** Do not sweep $\epsilon$ at $\mathrm{lr}=0.1$; nothing in
+$[10^{-3},10^{-1}]$, under either target form, changes the outcome there. Sweep
+$\epsilon\in\{0,10^{-3},10^{-2}\}$ with `--label-smoothing-target base_rate`
+only in combination with a learning rate that is already stable
+($\mathrm{lr}\in\{0.01,0.03\}$), where the question becomes whether the finite
+optimum buys calibration at a decoder that is genuinely converging. Values
+$\ge5\times10^{-2}$ are not worth grid space: at $p_0\approx1.5\times10^{-4}$ they
+cap the positive logit below $3$, which is a real constraint on a model that
+must express $P(\text{edge})$ ratios of several hundred between blocks.
+
+### Bounding the block logit: unit-norm cluster embeddings
+
+The smoothing arms above localise the failure precisely. Smoothing moves the
+*optimum*; the measurements say the problem is the *iterate*, which overshoots
+any finite target by a factor of several hundred within two epochs. The reason
+is structural: $\eta_{kk'} = u_k^\top v_{k'} + b$ is bilinear in unconstrained
+embeddings, and nothing in that parameterisation forbids
+$\lVert u_k\rVert\to\infty$. Past $|\eta|\approx17$ the float32 $\sigma(\eta)$ is
+exactly $0$ or $1$, every gradient is exactly zero, and the parameters freeze —
+which is exactly what the frozen $\max|\eta| = 3\,036.008$ of the control run is.
+
+`--u-norm unit` removes the freedom instead of penalising its use. Rows are
+normalised **in the forward pass**, so gradients flow through the normalisation
+and no post-hoc projection of the parameters is required, and the decoder
+becomes a cosine similarity with a temperature:
+
+$$ \eta_{kk'} = s\,\hat u_k^\top \hat v_{k'} + b, \qquad
+   \hat u = \frac{u}{\sqrt{\lVert u\rVert^2+\varepsilon}}, \qquad
+   |\eta_{kk'} - b| \le s . $$
+
+The guard $\varepsilon=10^{-12}$ sits inside the square root rather than as a
+clamp on the norm: $u/\max(\lVert u\rVert,\varepsilon)$ is finite at $u=0$ but
+its gradient is not, whereas the form above is smooth everywhere and still
+satisfies $\lVert\hat u\rVert\le1$, on which the bound rests.
+
+**The scale is not optional.** Pure unit norm gives $|\eta-b|\le1$, which lets
+the model modulate the edge probability only by a factor of $e$ around a base
+rate of $1.5\times10^{-4}$ — nowhere near enough to separate dense blocks from
+sparse ones. `--u-scale` chooses how $s$ is carried, `--u-scale-init` sets it:
+
+| `--u-scale` | parameters | ceiling on $\lvert\eta-b\rvert$ |
+| --- | --- | --- |
+| `fixed` | none | $s$, for the whole run — nothing to diverge |
+| `learned` | one, as $\log s$, so $s>0$ by construction | $s_T$, whatever the run ends at |
+| `per_row` | $K$, as $\log s_k$ | $\max_k s_k$ — one runaway row suffices |
+
+The default $s_0=8$ follows from the arithmetic of the graph rather than from
+taste. The bias carries the base rate, $b\approx-8.8$; a block of density $0.1$
+sits at $\eta\approx-2.2$, i.e. $+6.6$ above $b$. Eight logits of travel span
+the range the data occupy while capping $|\eta|$ near $17$, two orders of
+magnitude below what the unconstrained decoder reached.
+
+**Does it keep $\mathrm{lr}=0.1$ trainable?** Three arms, identical
+configuration to the collapse above ($d=256$, $\mathrm{lr}=0.1$, Bernoulli,
+`bfs_frac`$=1$, seed $0$, $12$ epochs, $\epsilon=0$):
+
+| | $\max\lvert\eta\rvert$ by epoch | best LL / AUC | best Hungarian | last LL / AUC | last Hungarian |
+| --- | --- | --- | --- | --- | --- |
+| `none` | $15,\,125,\,1129,\,3030,\,3036\ldots$ | $-2.661$ / $0.770$ | $2\,599$ | $-6.486$ / $0.500$ | $1\,507$ |
+| `unit` `fixed` $8$ | $14.2$, then $10.5$–$12.5$ | $-2.061$ / $0.938$ | $10\,152$ | $-2.073$ / $0.942$ | $11\,126$ |
+| `unit` `learned` $8$ | $11.0$–$15.3$, no trend | $-2.115$ / $0.936$ | $10\,854$ | $-2.150$ / $0.940$ | $12\,027$ |
+
+Yes — and not merely by avoiding divergence, which a model too weak to fit
+anything would also achieve. Both constrained arms improve monotonically to the
+end of the budget and are still improving at epoch $11$; AUC reaches $0.94$,
+past the $\approx0.9$ that $\mathrm{lr}=0.01$ bought at a tenth of the step
+size; and ground-truth agreement improves roughly fourfold over the control,
+from $2\,599$ to $10\,152$–$12\,027$ Hungarian. The bound is doing work rather
+than merely being satisfied: $\max|\eta|$ sits at $12$–$15$ against a ceiling of
+$b\pm8$, so the decoder is using most of its allowance.
+
+**The learned scale is stable.** It dips to $5.38$ in epoch $0$, then drifts up
+to $11.01$ by epoch $11$ — a factor of $1.4$ from its initialisation over a run
+in which the unconstrained embeddings grew by a factor of $200$. It does not
+relocate the divergence. That it settles slightly above $8$ is mild evidence
+that $s_0=8$ is a reasonable, marginally conservative default.
+
+**Selection now costs rather than saves.** Under normalisation the *last* epoch
+outscores the restored best-`val_ll` checkpoint on both AUC and Hungarian
+($11\,126$ against $10\,152$ fixed; $12\,027$ against $10\,854$ learned). The
+best-checkpoint machinery exists to salvage diverged runs; on a training curve
+that no longer collapses it gives up a little agreement instead. This is the
+same `val_metric`-versus-Hungarian anti-correlation reported above, now visible
+in a regime where the run is healthy.
+
+**Is the bias still free?** Yes, deliberately: it is the only unbounded term
+left in the decoder and it carries the base rate, which the model has no other
+way to express. It does not grow pathologically. Under `none` it moves only from
+$-6.46$ to $-9.75$ *while the embeddings blow up by a factor of $200$* — even in
+the diverged run it stays within about a logit of
+$\log(1.5\times10^{-4})$, which localises the runaway entirely in $u^\top v$.
+Under `unit` it settles at $-7.27$ (fixed) and $-8.29$ (learned). `decoder_bias`
+and `last_decoder_bias` are recorded so this remains checkable rather than
+assumed; should a future run show the bias drifting, it is the next term to
+constrain.
+
+**`--u-norm none` is the historical code path**, not an algebraically equivalent
+rewrite of it: at `none` the helper returns the same tensor objects. Verified
+rather than asserted. Commit `8bbdd47`, commit `e4604be` and the working tree at
+`--u-norm none`, run over an identical budget, produce bit-identical assignment,
+score and assignment-dict arrays (matching SHA-256) and identical `val_metric`,
+`val_auc` and `max_abs_train_logit` to the last digit, for all three trainers.
+The full $12$-epoch control arm reproduces `scratch/ls/d256_eps0.log` exactly,
+down to the frozen $3\,036.008$ and the final `val_ll` $=-6.486398$.
+
+Every run records `u_norm`, `u_scale`, `u_scale_init`, the realised scale at both
+the reported checkpoint and the last epoch (`u_scale_value`,
+`last_u_scale_value`, and `..._max`, which is the quantity that matters for
+`per_row`), and the bias. The scale is printed per epoch on a `[decoder]` line
+next to the bias, alongside the existing `max_abs_logit`.
+
+The same three flags exist on [`train_lv_e.py`](train_lv_e.py) and
+[`gnn_vsbm.py`](gnn_vsbm.py), where the guarantee is *partial* by construction
+and worth stating explicitly: `train_lv_e.py` adds $e_i\cdot e_j$ and
+`gnn_vsbm.py` adds $\gamma\,(h_i\cdot h_j)$, neither of which is normalised, so
+`--u-norm unit` bounds the cluster term alone.
+
+**Recommendation.** Prefer `unit` with `fixed` at $s_0=8$. It matches the
+learned scalar on every metric, has no parameter that can drift, and is the only
+arm whose ceiling is guaranteed for the whole run rather than merely observed
+after it. Use `learned` as the diagnostic that reports whether $s_0$ was badly
+chosen, and treat `per_row` as a last resort, since $\max_k s_k$ is a far weaker
+guarantee than a constant. Because normalisation, not smoothing, is what makes
+$\mathrm{lr}=0.1$ trainable, the two axes should be swept in that order:
+
+```bash
+--lv-u-norms none unit --lv-u-scales fixed learned --lv-u-scale-inits 5.0 8.0
+```
+
+which is $5$ arms per remaining grid point ($1$ unconstrained $+\,2\times2$),
+the unconstrained arm retaining the historical run names so accumulated
+artefacts and `--skip-existing` stay valid.
+
 Current LV grids fix the learning rate at the previously selected optimum and
 spend the budget on the likelihood and the rank $d$. A pilot at $5$ epochs
 established that `bfs_frac` is not worth a grid axis — Hungarian $1\,228$ at $0$,
@@ -600,7 +783,12 @@ The launcher now defaults to `--methods lv lv_e` with `--epochs 15
 --final-epochs 40`, matching the sampler / likelihood grid above; pass
 `--methods pca lv lv_e gnn_e` to restore the previous full sweep.
 `--grad-clip` is forwarded to `run_experiments.py` and from there to every LV /
-LV+$e$ / GNN trainer.
+LV+$e$ / GNN trainer, as are `--lv-label-smoothings`,
+`--lv-e-label-smoothings`, `--gnn-label-smoothings` and the shared
+`--label-smoothing-target`. Smoothing is a grid axis rather than a scalar, so
+$\epsilon$ can be compared within one sweep; the run-name suffix `_ls<eps>` is
+emitted only for $\epsilon\neq0$, leaving every existing prefix — and therefore
+`--skip-existing` and the accumulated result tables — untouched.
 
 **LV rerun at a stable learning rate.** Given the divergence above, the LV arm is
 re-run at $\mathrm{lr}\in\{0.01,0.03\}$ across $d\in\{64,128,256\}$ — $d=64$
