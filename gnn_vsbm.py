@@ -40,7 +40,10 @@ this scheme; no GraphSAINT normalization coefficients or halo hops are applied.
 As in the LV trainers, the reported model is the epoch attaining the best
 ``val_metric`` rather than the last one, and ground-truth agreement is recorded
 at both that checkpoint (``gt_*``) and the final epoch (``last_gt_*``) as a
-diagnostic that never feeds selection.
+diagnostic that never feeds selection. ``--label-smoothing`` is offered here for
+parity with those trainers: it caps the optimal Bernoulli logit at a finite
+value, applies to the **training loss only**, and is inert under the count
+likelihoods.
 """
 
 from __future__ import annotations
@@ -76,11 +79,15 @@ from heldout import (
 from index_mapping import load_mapping
 from subgraph_sampler import SubgraphBatchSampler
 from training_utils import (
+    LABEL_SMOOTHING_TARGETS,
     BestCheckpoint,
     checkpoint_metrics,
+    label_smoothing_line,
     prefixed,
     resolve_grad_clip,
+    resolve_label_smoothing,
     safe_optimizer_step,
+    smooth_binary_targets,
 )
 
 
@@ -377,6 +384,8 @@ def train(args: argparse.Namespace) -> dict:
     adj_counts, adj, adj_bin = load_adjacency(args.adjacency, args.likelihood)
     n = adj_bin.shape[0]
     nnz = int(adj_bin.nnz)
+    base_rate = max(float(adj_bin.mean()), 1e-8)
+    label_smoothing = resolve_label_smoothing(args.label_smoothing, args.likelihood)
     print(f"Loaded A with shape {adj_bin.shape}, nnz={nnz}, device={device}")
     print(HOP_BALL_NOTE)
     print(
@@ -384,6 +393,7 @@ def train(args: argparse.Namespace) -> dict:
         f"likelihood={args.likelihood} bfs_frac={args.bfs_frac} bfs_seeds={args.bfs_seeds} "
         f"gamma_init={args.gamma_init} propagation={args.propagation}"
     )
+    print(label_smoothing_line(label_smoothing, base_rate, args.label_smoothing_target))
     if args.propagation == "full":
         print(f"Full-graph propagation; minibatch edge masking={not args.no_edge_mask}")
 
@@ -406,7 +416,7 @@ def train(args: argparse.Namespace) -> dict:
     mp_nnz = int(a_bin._nnz())
     full_mean_out_degree = mp_nnz / max(n, 1)
 
-    edge_bias_init = float(np.log(max(float(adj_bin.mean()), 1e-8)))
+    edge_bias_init = float(np.log(base_rate))
     model = GNNvSBM(
         n=n,
         k=args.k,
@@ -435,6 +445,7 @@ def train(args: argparse.Namespace) -> dict:
     total_updates = 0
     n_skipped = 0
     last_epoch = -1
+    max_abs_eta = 0.0
     # A coverage-defined epoch is longer at higher bfs_frac, so an update budget is
     # what makes compute comparable across bfs_frac.
     epochs = args.epochs if args.target_updates is None else 10**9
@@ -447,6 +458,7 @@ def train(args: argparse.Namespace) -> dict:
             n_scored = 0
             n_batches = 0
             epoch_pos_obs = 0
+            epoch_max_abs_eta = 0.0
             block_edges = 0
             block_nodes = 0
 
@@ -499,7 +511,12 @@ def train(args: argparse.Namespace) -> dict:
                     alpha = model.soft_assignments(idx_t)
                     eta = model.edge_logits(h_src, h_tgt, idx_t, idx_t)
 
-                ll_pairs = pair_log_lik(args.likelihood, eta, block, model.log_r)
+                epoch_max_abs_eta = max(epoch_max_abs_eta, float(eta.detach().abs().max().item()))
+                # Training targets only; the held-out labels are never smoothed.
+                target = smooth_binary_targets(
+                    block, label_smoothing, base_rate, args.label_smoothing_target
+                )
+                ll_pairs = pair_log_lik(args.likelihood, eta, target, model.log_r)
                 ll = ((ll_pairs * keep).sum() / n_keep.clamp(min=1.0)) * float(idx.size * idx.size)
                 entropy = args.entropy_weight * -(alpha * log_clamp(alpha)).sum(1).mean()
                 loss = -(ll + entropy)
@@ -513,6 +530,7 @@ def train(args: argparse.Namespace) -> dict:
 
             mean_loss = loss_sum / max(n_scored, 1)
             cum_pos_obs += epoch_pos_obs
+            max_abs_eta = max(max_abs_eta, epoch_max_abs_eta)
             last_epoch = epoch
             print(sampler.coverage_line(epoch, n_batches, epoch_pos_obs, cum_pos_obs, nnz))
             block_deg = block_edges / max(block_nodes, 1)
@@ -534,7 +552,7 @@ def train(args: argparse.Namespace) -> dict:
             print(
                 f"loss={mean_loss:.4f} val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
                 f"best_val_ll={checkpoint.metric:.6f}@{checkpoint.epoch} gamma={gamma:.6f} "
-                f"clusters={n_used}/{args.k} "
+                f"clusters={n_used}/{args.k} max_abs_logit={epoch_max_abs_eta:.3f} "
                 f"updates={total_updates} skipped={n_skipped}"
             )
     except KeyboardInterrupt:
@@ -555,6 +573,9 @@ def train(args: argparse.Namespace) -> dict:
         total_updates,
         n_skipped,
         grad_clip,
+        label_smoothing,
+        base_rate,
+        max_abs_eta,
         checkpoint,
         state,
         last_epoch,
@@ -574,7 +595,14 @@ def eval_heldout(
     dtype: torch.dtype,
     chunk: int = 8192,
 ) -> tuple[float, float, float]:
-    """Held-out (Bernoulli LL, native LL, AUC) under one exact full-graph pass."""
+    """Held-out (Bernoulli LL, native LL, AUC) under one exact full-graph pass.
+
+    INVARIANT: this function scores the *true* unsmoothed $0/1$ labels
+    ``held["y"]``. Label smoothing is a property of the training loss alone and
+    must never reach this path -- note that it takes no smoothing argument, and
+    do not add one. ``val_metric`` and ``val_auc`` are therefore directly
+    comparable across every run ever made, smoothed or not.
+    """
     h_src, h_tgt = model.encode_full(a_out, a_in)
     src = torch.tensor(held["src"], dtype=torch.long, device=device)
     tgt = torch.tensor(held["tgt"], dtype=torch.long, device=device)
@@ -613,6 +641,9 @@ def save_results(
     total_updates: int,
     n_skipped: int,
     grad_clip: float | None,
+    label_smoothing: float,
+    base_rate: float,
+    max_abs_eta: float,
     checkpoint: BestCheckpoint,
     state: dict[str, torch.Tensor],
     last_epoch: int,
@@ -684,6 +715,11 @@ def save_results(
         "bfs_seeds": args.bfs_seeds,
         "propagation": args.propagation,
         "grad_clip": grad_clip,
+        "label_smoothing": args.label_smoothing,
+        "label_smoothing_target": args.label_smoothing_target,
+        "label_smoothing_applied": label_smoothing > 0.0,
+        "train_base_rate": base_rate,
+        "max_abs_train_logit": max_abs_eta,
         "edges_seen_x_nnz": cum_pos_obs / max(nnz, 1),
         "total_updates": total_updates,
         "skipped_updates": n_skipped,
@@ -751,6 +787,25 @@ def build_argparser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Global gradient-norm clip applied before each step; 0 or less disables it",
+    )
+    p.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.0,
+        help=(
+            "Bernoulli target smoothing eps in [0, 1); 0 (default) trains on hard "
+            "0/1 targets, whose optimal logit is unbounded. Applied to the training "
+            "loss only, and ignored for the count likelihoods"
+        ),
+    )
+    p.add_argument(
+        "--label-smoothing-target",
+        choices=LABEL_SMOOTHING_TARGETS,
+        default="base_rate",
+        help=(
+            "Prior the targets are pulled towards: 'base_rate' preserves the edge "
+            "marginal; 'uniform' (0.5) inflates negatives far above the true density"
+        ),
     )
     p.add_argument(
         "--gt",

@@ -31,3 +31,4 @@ lightning_unsup_sweep.log
 *.log
 
 .ipynb_checkpoints/
+scratch/

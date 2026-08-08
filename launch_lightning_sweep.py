@@ -22,6 +22,7 @@ from pathlib import Path
 from lightning_sdk import Machine, Studio
 
 from heldout import LIKELIHOODS
+from training_utils import LABEL_SMOOTHING_TARGETS
 
 REPO_ROOT = Path(__file__).resolve().parent
 REMOTE_LOG = "unsup_sweep.log"
@@ -157,6 +158,21 @@ def main() -> None:
         help="Global gradient-norm clip for LV / LV+e / GNN; 0 or less disables it",
     )
     parser.add_argument(
+        "--lv-label-smoothings",
+        type=float,
+        nargs="+",
+        default=[0.0],
+        help="LV Bernoulli label-smoothing grid; 0.0 keeps hard 0/1 targets",
+    )
+    parser.add_argument("--lv-e-label-smoothings", type=float, nargs="+", default=[0.0])
+    parser.add_argument("--gnn-label-smoothings", type=float, nargs="+", default=[0.0])
+    parser.add_argument(
+        "--label-smoothing-target",
+        choices=LABEL_SMOOTHING_TARGETS,
+        default="base_rate",
+        help="Prior the smoothed targets are pulled towards; 'base_rate' preserves the marginal",
+    )
+    parser.add_argument(
         "--lv-control-updates",
         type=int,
         default=0,
@@ -280,6 +296,10 @@ def main() -> None:
             f"--lv-e-likelihoods {join_nums(args.lv_e_likelihoods)} "
             f"--bfs-seeds {args.bfs_seeds} "
             f"--grad-clip {args.grad_clip} "
+            f"--lv-label-smoothings {join_nums(args.lv_label_smoothings)} "
+            f"--lv-e-label-smoothings {join_nums(args.lv_e_label_smoothings)} "
+            f"--gnn-label-smoothings {join_nums(args.gnn_label_smoothings)} "
+            f"--label-smoothing-target {args.label_smoothing_target} "
             f"--lv-control-updates {args.lv_control_updates} "
             f"--gnn-layers {join_nums(args.gnn_layers)} --gnn-dims {join_nums(args.gnn_dims)} "
             f"--gnn-lrs {join_nums(args.gnn_lrs)} "

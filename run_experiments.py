@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,7 @@ from scipy.sparse import load_npz
 
 from evaluate_clustering import evaluate_pair, load_assignment_dict, load_ground_truth
 from heldout import LIKELIHOODS, make_heldout_pairs, make_heldout_rows, save_heldout
+from training_utils import LABEL_SMOOTHING_TARGETS
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,19 @@ class RunSpec:
     command: list[str]
     prefix: str
     hyperparams: dict
+
+
+def smoothing_tag(eps: float) -> str:
+    """Run-name suffix for label smoothing, empty at ``eps=0``.
+
+    Unsmoothed runs keep the prefixes every existing artefact was written under,
+    so ``--skip-existing`` and the accumulated result tables stay valid.
+    """
+    return f"_ls{eps}" if eps else ""
+
+
+def smoothing_flags(eps: float, target: str) -> list[str]:
+    return ["--label-smoothing", str(eps), "--label-smoothing-target", target]
 
 
 def run_cmd(cmd: list[str]) -> None:
@@ -110,63 +125,69 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
             for lr in args.lv_lrs:
                 for bfs_frac in args.lv_bfs_fracs:
                     for likelihood in args.lv_likelihoods:
-                        name = f"hp_lv_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}"
-                        prefix = name
-                        specs.append(
-                            RunSpec(
-                                name=name,
-                                method="lv",
-                                prefix=prefix,
-                                hyperparams={
-                                    "d": d,
-                                    "lr": lr,
-                                    "bfs_frac": bfs_frac,
-                                    "likelihood": likelihood,
-                                },
-                                command=[
-                                    py,
-                                    "train_lv_vsbm.py",
-                                    "--k",
-                                    str(args.k),
-                                    "--d",
-                                    str(d),
-                                    "--lr",
-                                    str(lr),
-                                    "--bfs-frac",
-                                    str(bfs_frac),
-                                    "--bfs-seeds",
-                                    str(args.bfs_seeds),
-                                    "--likelihood",
-                                    likelihood,
-                                    "--grad-clip",
-                                    str(args.grad_clip),
-                                    "--epochs",
-                                    str(args.epochs),
-                                    "--minibatch",
-                                    str(args.minibatch),
-                                    "--seed",
-                                    str(args.split_seed),
-                                    "--device",
-                                    args.device,
-                                    "--heldout-pairs",
-                                    args.heldout_pairs,
-                                    "--out-prefix",
-                                    prefix,
-                                ],
+                        for eps in args.lv_label_smoothings:
+                            name = (
+                                f"hp_lv_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}{smoothing_tag(eps)}"
                             )
-                        )
+                            prefix = name
+                            specs.append(
+                                RunSpec(
+                                    name=name,
+                                    method="lv",
+                                    prefix=prefix,
+                                    hyperparams={
+                                        "d": d,
+                                        "lr": lr,
+                                        "bfs_frac": bfs_frac,
+                                        "likelihood": likelihood,
+                                        "label_smoothing": eps,
+                                    },
+                                    command=[
+                                        py,
+                                        "train_lv_vsbm.py",
+                                        "--k",
+                                        str(args.k),
+                                        "--d",
+                                        str(d),
+                                        "--lr",
+                                        str(lr),
+                                        "--bfs-frac",
+                                        str(bfs_frac),
+                                        "--bfs-seeds",
+                                        str(args.bfs_seeds),
+                                        "--likelihood",
+                                        likelihood,
+                                        "--grad-clip",
+                                        str(args.grad_clip),
+                                        *smoothing_flags(eps, args.label_smoothing_target),
+                                        "--epochs",
+                                        str(args.epochs),
+                                        "--minibatch",
+                                        str(args.minibatch),
+                                        "--seed",
+                                        str(args.split_seed),
+                                        "--device",
+                                        args.device,
+                                        "--heldout-pairs",
+                                        args.heldout_pairs,
+                                        "--out-prefix",
+                                        prefix,
+                                    ],
+                                )
+                            )
 
     if "lv" in methods and args.lv_control_updates:
         # A coverage-defined epoch is longer at higher bfs_frac, so the epoch-matched
         # grid above also hands the BFS arms more gradient steps. This control gives
         # uniform sampling the same update budget, separating the two effects.
-        # One dim and one likelihood suffice: the control isolates the sampler, not
-        # the rank or the observation model, and each control costs as much as a
-        # BFS run.
+        # One dim, one likelihood and one smoothing level suffice: the control
+        # isolates the sampler, not the rank, the observation model or the target
+        # form, and each control costs as much as a BFS run.
         for d in args.lv_dims[:1]:
             for lr in args.lv_lrs:
                 for likelihood in args.lv_likelihoods[:1]:
-                    name = f"hp_lv_control_d{d}_lr{lr}_{likelihood}"
+                    eps = args.lv_label_smoothings[0]
+                    name = f"hp_lv_control_d{d}_lr{lr}_{likelihood}{smoothing_tag(eps)}"
                     specs.append(
                         RunSpec(
                             name=name,
@@ -177,6 +198,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                 "lr": lr,
                                 "bfs_frac": 0.0,
                                 "likelihood": likelihood,
+                                "label_smoothing": eps,
                                 "target_updates": args.lv_control_updates,
                             },
                             command=[
@@ -196,6 +218,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                 likelihood,
                                 "--grad-clip",
                                 str(args.grad_clip),
+                                *smoothing_flags(eps, args.label_smoothing_target),
                                 "--target-updates",
                                 str(args.lv_control_updates),
                                 "--epochs",
@@ -215,123 +238,135 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                     )
 
     if "lv_e" in methods:
-        for d in args.lv_e_dims:
-            for d_e in args.lv_e_d_es:
-                for lr in args.lv_e_lrs:
-                    for e_wd in args.lv_e_wds:
-                        for bfs_frac in args.lv_e_bfs_fracs:
-                            for likelihood in args.lv_e_likelihoods:
-                                name = (
-                                    f"hp_lv_e_d{d}_de{d_e}_lr{lr}_ewd{e_wd}"
-                                    f"_bfs{bfs_frac}_{likelihood}"
-                                )
-                                prefix = name
-                                specs.append(
-                                    RunSpec(
-                                        name=name,
-                                        method="lv_e",
-                                        prefix=prefix,
-                                        hyperparams={
-                                            "d": d,
-                                            "d_e": d_e,
-                                            "lr": lr,
-                                            "e_wd": e_wd,
-                                            "bfs_frac": bfs_frac,
-                                            "likelihood": likelihood,
-                                        },
-                                        command=[
-                                            py,
-                                            "train_lv_e.py",
-                                            "--k",
-                                            str(args.k),
-                                            "--d",
-                                            str(d),
-                                            "--d-e",
-                                            str(d_e),
-                                            "--e-wd",
-                                            str(e_wd),
-                                            "--lr",
-                                            str(lr),
-                                            "--bfs-frac",
-                                            str(bfs_frac),
-                                            "--bfs-seeds",
-                                            str(args.bfs_seeds),
-                                            "--likelihood",
-                                            likelihood,
-                                            "--grad-clip",
-                                            str(args.grad_clip),
-                                            "--epochs",
-                                            str(args.epochs),
-                                            "--minibatch",
-                                            str(args.minibatch),
-                                            "--seed",
-                                            str(args.split_seed),
-                                            "--device",
-                                            args.device,
-                                            "--heldout-pairs",
-                                            args.heldout_pairs,
-                                            "--out-prefix",
-                                            prefix,
-                                        ],
-                                    )
-                                )
+        # Flattened with ``product``: the grid is seven-dimensional and nested
+        # ``for`` blocks would indent the command list past readability.
+        lv_e_grid = product(
+            args.lv_e_dims,
+            args.lv_e_d_es,
+            args.lv_e_lrs,
+            args.lv_e_wds,
+            args.lv_e_bfs_fracs,
+            args.lv_e_likelihoods,
+            args.lv_e_label_smoothings,
+        )
+        for d, d_e, lr, e_wd, bfs_frac, likelihood, eps in lv_e_grid:
+            name = (
+                f"hp_lv_e_d{d}_de{d_e}_lr{lr}_ewd{e_wd}"
+                f"_bfs{bfs_frac}_{likelihood}{smoothing_tag(eps)}"
+            )
+            specs.append(
+                RunSpec(
+                    name=name,
+                    method="lv_e",
+                    prefix=name,
+                    hyperparams={
+                        "d": d,
+                        "d_e": d_e,
+                        "lr": lr,
+                        "e_wd": e_wd,
+                        "bfs_frac": bfs_frac,
+                        "likelihood": likelihood,
+                        "label_smoothing": eps,
+                    },
+                    command=[
+                        py,
+                        "train_lv_e.py",
+                        "--k",
+                        str(args.k),
+                        "--d",
+                        str(d),
+                        "--d-e",
+                        str(d_e),
+                        "--e-wd",
+                        str(e_wd),
+                        "--lr",
+                        str(lr),
+                        "--bfs-frac",
+                        str(bfs_frac),
+                        "--bfs-seeds",
+                        str(args.bfs_seeds),
+                        "--likelihood",
+                        likelihood,
+                        "--grad-clip",
+                        str(args.grad_clip),
+                        *smoothing_flags(eps, args.label_smoothing_target),
+                        "--epochs",
+                        str(args.epochs),
+                        "--minibatch",
+                        str(args.minibatch),
+                        "--seed",
+                        str(args.split_seed),
+                        "--device",
+                        args.device,
+                        "--heldout-pairs",
+                        args.heldout_pairs,
+                        "--out-prefix",
+                        name,
+                    ],
+                )
+            )
 
     if "gnn" in methods:
-        for layers in args.gnn_layers:
-            for d in args.gnn_dims:
-                for lr in args.gnn_lrs:
-                    for bfs_frac in args.gnn_bfs_fracs:
-                        for likelihood in args.gnn_likelihoods:
-                            name = f"hp_gnn_L{layers}_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}"
-                            prefix = name
-                            specs.append(
-                                RunSpec(
-                                    name=name,
-                                    method="gnn",
-                                    prefix=prefix,
-                                    hyperparams={
-                                        "layers": layers,
-                                        "d": d,
-                                        "lr": lr,
-                                        "bfs_frac": bfs_frac,
-                                        "likelihood": likelihood,
-                                    },
-                                    command=[
-                                        py,
-                                        "gnn_vsbm.py",
-                                        "--k",
-                                        str(args.k),
-                                        "--d",
-                                        str(d),
-                                        "--layers",
-                                        str(layers),
-                                        "--lr",
-                                        str(lr),
-                                        "--bfs-frac",
-                                        str(bfs_frac),
-                                        "--bfs-seeds",
-                                        str(args.bfs_seeds),
-                                        "--likelihood",
-                                        likelihood,
-                                        "--propagation",
-                                        args.gnn_propagation,
-                                        "--grad-clip",
-                                        str(args.grad_clip),
-                                        "--epochs",
-                                        str(args.epochs),
-                                        "--minibatch",
-                                        str(args.minibatch),
-                                        "--seed",
-                                        str(args.split_seed),
-                                        "--device",
-                                        args.device,
-                                        "--heldout-pairs",
-                                        args.heldout_pairs,
-                                        "--out-prefix",
-                                        prefix,
-                                    ],
-                                )
-                            )
+        gnn_grid = product(
+            args.gnn_layers,
+            args.gnn_dims,
+            args.gnn_lrs,
+            args.gnn_bfs_fracs,
+            args.gnn_likelihoods,
+            args.gnn_label_smoothings,
+        )
+        for layers, d, lr, bfs_frac, likelihood, eps in gnn_grid:
+            name = f"hp_gnn_L{layers}_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}{smoothing_tag(eps)}"
+            specs.append(
+                RunSpec(
+                    name=name,
+                    method="gnn",
+                    prefix=name,
+                    hyperparams={
+                        "layers": layers,
+                        "d": d,
+                        "lr": lr,
+                        "bfs_frac": bfs_frac,
+                        "likelihood": likelihood,
+                        "label_smoothing": eps,
+                    },
+                    command=[
+                        py,
+                        "gnn_vsbm.py",
+                        "--k",
+                        str(args.k),
+                        "--d",
+                        str(d),
+                        "--layers",
+                        str(layers),
+                        "--lr",
+                        str(lr),
+                        "--bfs-frac",
+                        str(bfs_frac),
+                        "--bfs-seeds",
+                        str(args.bfs_seeds),
+                        "--likelihood",
+                        likelihood,
+                        "--propagation",
+                        args.gnn_propagation,
+                        "--grad-clip",
+                        str(args.grad_clip),
+                        *smoothing_flags(eps, args.label_smoothing_target),
+                        "--epochs",
+                        str(args.epochs),
+                        "--minibatch",
+                        str(args.minibatch),
+                        "--seed",
+                        str(args.split_seed),
+                        "--device",
+                        args.device,
+                        "--heldout-pairs",
+                        args.heldout_pairs,
+                        "--out-prefix",
+                        name,
+                    ],
+                )
+            )
 
     if "gnn_e" in methods:
         for layers in args.gnn_e_layers:
@@ -454,7 +489,11 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
             elif method == "lv":
                 control = hp.get("target_updates")
                 tag = "control" if control else f"bfs{hp['bfs_frac']}"
-                name = f"final_lv_d{hp['d']}_lr{hp['lr']}_{tag}_{hp['likelihood']}_seed{seed}"
+                eps = float(hp.get("label_smoothing", 0.0))
+                name = (
+                    f"final_lv_d{hp['d']}_lr{hp['lr']}_{tag}_{hp['likelihood']}"
+                    f"{smoothing_tag(eps)}_seed{seed}"
+                )
                 cmd = [
                     py,
                     "train_lv_vsbm.py",
@@ -472,6 +511,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     str(hp["likelihood"]),
                     "--grad-clip",
                     str(args.grad_clip),
+                    *smoothing_flags(eps, args.label_smoothing_target),
                     "--minibatch",
                     str(args.minibatch),
                     "--seed",
@@ -490,9 +530,10 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                 else:
                     cmd += ["--epochs", str(args.final_epochs)]
             elif method == "lv_e":
+                eps = float(hp.get("label_smoothing", 0.0))
                 name = (
                     f"final_lv_e_d{hp['d']}_de{hp['d_e']}_lr{hp['lr']}_ewd{hp['e_wd']}_"
-                    f"bfs{hp['bfs_frac']}_{hp['likelihood']}_seed{seed}"
+                    f"bfs{hp['bfs_frac']}_{hp['likelihood']}{smoothing_tag(eps)}_seed{seed}"
                 )
                 cmd = [
                     py,
@@ -515,6 +556,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     str(hp["likelihood"]),
                     "--grad-clip",
                     str(args.grad_clip),
+                    *smoothing_flags(eps, args.label_smoothing_target),
                     "--epochs",
                     str(args.final_epochs),
                     "--minibatch",
@@ -562,9 +604,10 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     name,
                 ]
             elif method == "gnn":
+                eps = float(hp.get("label_smoothing", 0.0))
                 name = (
                     f"final_gnn_L{hp['layers']}_d{hp['d']}_lr{hp['lr']}_"
-                    f"bfs{hp['bfs_frac']}_{hp['likelihood']}_seed{seed}"
+                    f"bfs{hp['bfs_frac']}_{hp['likelihood']}{smoothing_tag(eps)}_seed{seed}"
                 )
                 cmd = [
                     py,
@@ -587,6 +630,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     str(hp.get("propagation", args.gnn_propagation)),
                     "--grad-clip",
                     str(args.grad_clip),
+                    *smoothing_flags(eps, args.label_smoothing_target),
                     "--epochs",
                     str(args.final_epochs),
                     "--minibatch",
@@ -652,6 +696,10 @@ DIAGNOSTIC_KEYS = (
     "best_epoch",
     "last_epoch",
     "grad_clip",
+    "label_smoothing",
+    "label_smoothing_target",
+    "label_smoothing_applied",
+    "max_abs_train_logit",
     "skipped_updates",
 )
 
@@ -750,6 +798,32 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--lv-label-smoothings",
+        type=float,
+        nargs="+",
+        default=[0.0],
+        help=(
+            "LV Bernoulli label-smoothing grid; 0.0 (default) keeps hard 0/1 targets "
+            "and the historical run names"
+        ),
+    )
+    p.add_argument(
+        "--lv-e-label-smoothings", type=float, nargs="+", default=[0.0], help="LV+e smoothing grid"
+    )
+    p.add_argument(
+        "--gnn-label-smoothings", type=float, nargs="+", default=[0.0], help="GNN smoothing grid"
+    )
+    p.add_argument(
+        "--label-smoothing-target",
+        choices=LABEL_SMOOTHING_TARGETS,
+        default="base_rate",
+        help=(
+            "Prior the smoothed targets are pulled towards, shared by every method: "
+            "'base_rate' preserves the edge marginal on a graph of density ~1e-4; "
+            "'uniform' (0.5) does not"
+        ),
+    )
+    p.add_argument(
         "--lv-control-updates",
         type=int,
         default=0,
@@ -843,6 +917,7 @@ def main() -> None:
             if method in {"lv", "lv_e", "gnn"}:
                 hp["bfs_frac"] = float(best["bfs_frac"])
                 hp["likelihood"] = str(best["likelihood"])
+                hp["label_smoothing"] = float(best.get("label_smoothing", 0.0))
             if method == "lv" and best.get("target_updates"):
                 # Carry the matched-compute budget so a selected control stays a
                 # control in the finals instead of reverting to epoch matching.

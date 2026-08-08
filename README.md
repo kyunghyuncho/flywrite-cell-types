@@ -385,6 +385,77 @@ Hungarian ($\approx1.5$–$1.9\times10^{3}$ against $8.5\times10^{3}$ in the
 full-budget finals), so the finding needs confirmation at full budget; both
 numbers are now emitted by every run precisely so that confirmation is free.
 
+### Label smoothing: giving the decoder somewhere to stop
+
+Clipping bounds the *step*; it does not bound the *target* the step is walking
+towards. With hard $0/1$ labels the Bernoulli objective
+
+$$ \ell(\eta) = y\log\sigma(\eta) + (1-y)\log\bigl(1-\sigma(\eta)\bigr) $$
+
+is maximised only at $\eta=\pm\infty$, so a decoder that has fitted the
+partition can still reduce its training loss indefinitely by inflating
+$\lVert\eta\rVert$. That is precisely the observed failure: several diverged runs
+report an *identical* held-out likelihood of $-11\,685.014$, the value produced
+when every prediction is pinned against the `ETA_MIN` / `ETA_MAX` clamp in
+[`heldout.py`](heldout.py). Saturation, not poor fit.
+
+`--label-smoothing` $\epsilon$ replaces the target by
+
+$$ \tilde y = (1-\epsilon)\,y + \epsilon\,p_0, $$
+
+whose optimum is the **finite** logit $\operatorname{logit}(\tilde y)$. The
+decoder now has a place to stop.
+
+**Which $p_0$?** The textbook choice $p_0=\tfrac12$ is wrong for this graph. The
+global density is $\approx1.5\times10^{-4}$ and the within-block density under
+BFS sampling is $\approx2.7\times10^{-3}$, so symmetric smoothing would set every
+non-edge target to $\epsilon/2$ — for $\epsilon=10^{-2}$ that is $5\times10^{-3}$,
+more than thirty times the true base rate — and bias the decoder towards
+predicting edges everywhere. Smoothing towards the empirical base rate instead
+leaves the marginal exactly invariant,
+
+$$ \mathbb{E}[\tilde y] = (1-\epsilon)p_0 + \epsilon p_0 = p_0, $$
+
+which is the property one actually wants from a regulariser that is not supposed
+to change what the model believes about density. `--label-smoothing-target`
+selects between `base_rate` (default) and `uniform`; the asymmetry of the
+resulting ceiling is the point:
+
+| $\epsilon$ | `base_rate` optimal logits | `uniform` optimal logits |
+| --- | --- | --- |
+| $10^{-3}$ | $[-15.71,\;+6.91]$ | $[-7.60,\;+7.60]$ |
+| $10^{-2}$ | $[-13.41,\;+4.60]$ | $[-5.29,\;+5.29]$ |
+| $5\times10^{-2}$ | $[-11.80,\;+2.94]$ | $[-3.66,\;+3.66]$ |
+
+`base_rate` keeps a wide negative range — appropriate when almost every pair is a
+non-edge — while capping the positive side, which is the direction the diverging
+decoder actually runs away in.
+
+**Training only.** Smoothing is applied to the training loss and never to
+evaluation. `eval_heldout` in all three trainers scores the true unsmoothed
+labels, takes no smoothing argument, and carries an explicit invariant comment
+saying so, so `val_metric` (`heldout_bernoulli_ll`) and `val_auc` stay directly
+comparable with every result collected before this change. At $\epsilon=0$ the
+smoothing helper returns the target tensor unmodified, so the unsmoothed path is
+the same code that produced those results — verified by rerunning all three
+trainers against commit `8bbdd47` and obtaining identical `val_metric`,
+identical assignments and bit-identical scores.
+
+**Count likelihoods are deliberately excluded.** Label smoothing interpolates a
+binary target towards a probability; Poisson and negative-binomial targets are
+synapse counts, and shrinking a count towards a probability would corrupt the
+sufficient statistic of the rate rather than regularise it. The flag is
+therefore a no-op under `--likelihood poisson|nb` and prints one explicit
+`[label-smoothing] IGNORED` line. This costs little: the negative binomial was
+already the only likelihood that survived every width at $\mathrm{lr}=0.1$,
+because $-e^{\eta}$ bounds its log-rate from above and the $y=0$ direction
+$\eta\to-\infty$ has vanishing gradient, so it has no runaway comparable to the
+Bernoulli one.
+
+Every run now records `label_smoothing`, `label_smoothing_target`,
+`label_smoothing_applied`, `train_base_rate` and `max_abs_train_logit`; the last
+is the direct observable for the hypothesis and is printed per epoch.
+
 Current LV grids fix the learning rate at the previously selected optimum and
 spend the budget on the likelihood and the rank $d$. A pilot at $5$ epochs
 established that `bfs_frac` is not worth a grid axis — Hungarian $1\,228$ at $0$,

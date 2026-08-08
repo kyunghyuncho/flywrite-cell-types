@@ -19,6 +19,12 @@ parameters score at chance. Ground-truth agreement is recorded at *both* the
 restored best checkpoint (``gt_*``) and the final epoch (``last_gt_*``) so the
 cost of that divergence can be read off directly; neither quantity participates
 in selection.
+
+``--label-smoothing`` addresses the cause of that divergence rather than its
+symptom: hard $0/1$ targets place the Bernoulli optimum at $\\eta=\\pm\\infty$,
+whereas a smoothed target caps it at a finite logit (see
+[`training_utils`](training_utils.py)). It is applied to the **training loss
+only** and is inert under the count likelihoods.
 """
 
 from __future__ import annotations
@@ -53,11 +59,15 @@ from heldout import (
 from index_mapping import load_mapping
 from subgraph_sampler import SubgraphBatchSampler
 from training_utils import (
+    LABEL_SMOOTHING_TARGETS,
     BestCheckpoint,
     checkpoint_metrics,
+    label_smoothing_line,
     prefixed,
     resolve_grad_clip,
+    resolve_label_smoothing,
     safe_optimizer_step,
+    smooth_binary_targets,
 )
 
 
@@ -119,6 +129,11 @@ def expected_block_ll(
     """$\\sum_{ij}\\mathbb{E}_{q}[\\log p(y_{ij})]$ aggregated over the cluster-pair grid.
 
     Terms that are constant in the parameters ($-\\log y_{ij}!$) are dropped.
+
+    ``block`` carries the training targets: raw synapse counts under Poisson /
+    NB, and the $0/1$ pattern -- possibly label-smoothed -- under Bernoulli. The
+    Bernoulli term is linear in the target, so smoothing passes through the
+    $K\\times K$ aggregation unchanged.
     """
     if likelihood == "bernoulli":
         w_edge = q.T @ (block * keep) @ q
@@ -154,7 +169,14 @@ def eval_heldout(
     dtype: torch.dtype,
     chunk: int = 8192,
 ) -> tuple[float, float, float]:
-    """Held-out (Bernoulli LL, native LL, AUC) under $\\mathbb{E}_{q_i q_j}$."""
+    """Held-out (Bernoulli LL, native LL, AUC) under $\\mathbb{E}_{q_i q_j}$.
+
+    INVARIANT: this function scores the *true* unsmoothed $0/1$ labels
+    ``held["y"]``. Label smoothing is a property of the training loss alone and
+    must never reach this path -- note that it takes no smoothing argument, and
+    do not add one. ``val_metric`` and ``val_auc`` are therefore directly
+    comparable across every run ever made, smoothed or not.
+    """
     alpha = torch.softmax(q_logits, dim=-1)
     eta = u_left @ u_right.T + bias
     prob_kk = edge_prob_kk(likelihood, eta, log_r)
@@ -202,11 +224,14 @@ def train(args: argparse.Namespace) -> dict:
     adj_counts, adj = load_adjacency(args.adjacency, args.likelihood)
     n = adj.shape[0]
     nnz = int(adj.nnz)
+    base_rate = max(float(adj.mean()), 1e-8)
+    label_smoothing = resolve_label_smoothing(args.label_smoothing, args.likelihood)
     print(f"Loaded A with shape {adj.shape}, nnz={nnz}, device={device}")
     print(
         f"LV: d={args.d} lr={args.lr} likelihood={args.likelihood} "
         f"bfs_frac={args.bfs_frac} bfs_seeds={args.bfs_seeds}"
     )
+    print(label_smoothing_line(label_smoothing, base_rate, args.label_smoothing_target))
 
     held = load_heldout(Path(args.heldout_pairs))
     held_src_np = held["src"]
@@ -223,9 +248,7 @@ def train(args: argparse.Namespace) -> dict:
     u_right = nn.Parameter(
         (1.0 / np.sqrt(args.k * args.d)) * torch.randn(args.k, args.d, dtype=dtype, device=device)
     )
-    bias = nn.Parameter(
-        torch.log(torch.tensor([max(float(adj.mean()), 1e-8)], dtype=dtype, device=device))
-    )
+    bias = nn.Parameter(torch.log(torch.tensor([base_rate], dtype=dtype, device=device)))
     q_logits = nn.Parameter((1.0 / args.k) * torch.randn(n, args.k, dtype=dtype, device=device))
     log_r = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
 
@@ -253,6 +276,7 @@ def train(args: argparse.Namespace) -> dict:
     total_updates = 0
     n_skipped = 0
     last_epoch = -1
+    max_abs_eta = 0.0
     # A coverage-defined epoch is longer at higher bfs_frac, so an update budget is
     # what makes compute comparable across bfs_frac.
     epochs = args.epochs if args.target_updates is None else 10**9
@@ -265,6 +289,7 @@ def train(args: argparse.Namespace) -> dict:
             n_scored = 0
             n_batches = 0
             epoch_pos_obs = 0
+            epoch_max_abs_eta = 0.0
 
             for idx in tqdm(sampler.epoch(), desc=f"lv epoch {epoch}"):
                 if args.max_updates is not None and n_batches >= args.max_updates:
@@ -289,7 +314,12 @@ def train(args: argparse.Namespace) -> dict:
                 idx_t = torch.from_numpy(idx).to(device)
                 q = torch.softmax(q_logits[idx_t], dim=-1)
                 eta = u_left @ u_right.T + bias
-                obj = expected_block_ll(args.likelihood, q, block, keep, eta, log_r)
+                epoch_max_abs_eta = max(epoch_max_abs_eta, float(eta.detach().abs().max().item()))
+                # Training targets only; the held-out labels are never smoothed.
+                target = smooth_binary_targets(
+                    block, label_smoothing, base_rate, args.label_smoothing_target
+                )
+                obj = expected_block_ll(args.likelihood, q, target, keep, eta, log_r)
                 obj = obj - (q * log_clamp(q)).sum(1).mean()
                 # Normalize roughly by #kept pairs so loss scale is stable.
                 obj = obj * (idx.size * idx.size) / n_keep.clamp(min=1)
@@ -303,6 +333,7 @@ def train(args: argparse.Namespace) -> dict:
 
             mean_loss = loss_sum / max(n_scored, 1)
             cum_pos_obs += epoch_pos_obs
+            max_abs_eta = max(max_abs_eta, epoch_max_abs_eta)
             last_epoch = epoch
             print(sampler.coverage_line(epoch, n_batches, epoch_pos_obs, cum_pos_obs, nnz))
             val_ll, _, val_auc = eval_heldout(
@@ -313,7 +344,7 @@ def train(args: argparse.Namespace) -> dict:
             print(
                 f"loss={mean_loss:.4f} val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
                 f"best_val_ll={checkpoint.metric:.6f}@{checkpoint.epoch} "
-                f"clusters={n_used}/{args.k} "
+                f"clusters={n_used}/{args.k} max_abs_logit={epoch_max_abs_eta:.3f} "
                 f"updates={total_updates} skipped={n_skipped}"
             )
     except KeyboardInterrupt:
@@ -384,6 +415,11 @@ def train(args: argparse.Namespace) -> dict:
         "bfs_frac": args.bfs_frac,
         "bfs_seeds": args.bfs_seeds,
         "grad_clip": grad_clip,
+        "label_smoothing": args.label_smoothing,
+        "label_smoothing_target": args.label_smoothing_target,
+        "label_smoothing_applied": label_smoothing > 0.0,
+        "train_base_rate": base_rate,
+        "max_abs_train_logit": max_abs_eta,
         "edges_seen_x_nnz": cum_pos_obs / max(nnz, 1),
         "total_updates": total_updates,
         "skipped_updates": n_skipped,
@@ -438,6 +474,25 @@ def build_argparser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Global gradient-norm clip applied before each step; 0 or less disables it",
+    )
+    p.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.0,
+        help=(
+            "Bernoulli target smoothing eps in [0, 1); 0 (default) trains on hard "
+            "0/1 targets, whose optimal logit is unbounded. Applied to the training "
+            "loss only, and ignored for the count likelihoods"
+        ),
+    )
+    p.add_argument(
+        "--label-smoothing-target",
+        choices=LABEL_SMOOTHING_TARGETS,
+        default="base_rate",
+        help=(
+            "Prior the targets are pulled towards: 'base_rate' preserves the edge "
+            "marginal; 'uniform' (0.5) inflates negatives far above the true density"
+        ),
     )
     p.add_argument(
         "--gt",
