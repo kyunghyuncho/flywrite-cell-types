@@ -218,17 +218,53 @@ $$
 $$
 
 Node features start at $h_i^{(0)}=\sum_k\alpha_i^k u_k$ and are refined by $L$ directed
-GNN layers on a minibatch-edge-masked adjacency (in/out aggregation, LayerNorm,
-residual). **Jumping Knowledge** concatenates $[h^{(0)},\ldots,h^{(L)}]$ and projects
-back to $d$ before the src/tgt heads, so deeper layers expand the receptive field
-without erasing 0-hop cluster identity. Learnable $\gamma$ is initialized at $0$, so
-$L{=}0$ recovers an LV-like decoder.
+GNN layers (in/out aggregation, LayerNorm, residual). **Jumping Knowledge**
+concatenates $[h^{(0)},\ldots,h^{(L)}]$ and projects back to $d$ before the src/tgt
+heads, so deeper layers expand the receptive field without erasing 0-hop cluster
+identity. Learnable $\gamma$ is initialized at $0$, so training starts as pure LV and
+has to switch the GNN on; $\gamma$ is logged per epoch on a greppable `[gamma]` line.
+Unlike the $+e$ variants there is no free per-node residual table, so the only
+per-node parameter is $q_i$ and likelihood gains must be routed through the
+assignments.
+
+The trainer shares the LV data path: square induced-subgraph minibatches from
+[`subgraph_sampler.SubgraphBatchSampler`](subgraph_sampler.py) with the same
+`--bfs-frac` / `--bfs-seeds` semantics and `[coverage]` diagnostic, the diagonal
+masked out of the loss alongside the held-out pairs, `--likelihood
+{bernoulli,poisson,nb}` applied per pair over unbinarized counts (learnable
+$\log r$ optimized only under `nb`), and `--target-updates` as a total update
+budget for matched-compute controls. `val_metric` remains the held-out
+**Bernoulli** log-likelihood; `val_auc` and `val_native_ll` are reported alongside.
+
+**Subgraph-local training, full-graph evaluation.** Message passing during
+training runs over the induced subgraph on the sampled block only (GraphSAINT /
+Cluster-GCN style, `--propagation subgraph`, the default), and `q_logits` is
+indexed down to the block *before* the softmax, so no $n\times K$ tensor is
+materialized in a training step. Evaluation, held-out scoring and assignment
+extraction always run one exact full-graph pass (`encode_full`, which asserts it
+covered every node). `--propagation full` restores the previous behaviour, where
+every step propagates over all $n$ nodes and the block's own edges are masked out
+of the propagation graph (`--no-edge-mask` disables that masking); measured
+locally it costs $3$–$4\times$ more per update at $L\in\{2,4\}$ while the
+subgraph-local step is essentially flat in $L$. A non-finite loss or gradient
+skips the update instead of poisoning every parameter, and the count is reported
+as `skipped=` on the epoch line; this matters for `--propagation full`, whose
+gradients grow by four orders of magnitude within ten updates and were observed
+to overflow on the Metal backend.
+
+The price is truncated neighbourhoods at the block boundary: at `bfs_frac`$=1$ a
+$2048$-node block holds $\approx 1.1\times10^4$ directed edges, a mean in-block
+out-degree of $5.5$ against $19.8$ on the full graph, i.e. $\approx 28\%$ of each
+node's neighbourhood. No GraphSAINT normalization coefficients or halo hops are
+applied. This also makes `bfs_frac` load-bearing in a way it is not for LV: at
+`bfs_frac`$=0$ the induced block holds only $\approx 6\times10^2$ edges
+(out-degree $0.30$, $1.5\%$ of the full graph), so the GNN has almost no graph to
+propagate over and the model degenerates to LV.
 
 On this connectome, undirected hop balls (median, excl. self) are already large:
 $L{=}1\sim 18$, $L{=}2\sim 3\times 10^3$, $L{=}3\sim 3.7\times 10^4$,
-$L{=}4\sim 10^5$ nodes. Minibatch edge masking removes $\ll 1\%$ of edges, so
-neighbourhood starvation is not the issue—oversmoothing from replacing the LV
-decoder was. The residual+JK design addresses that.
+$L{=}4\sim 10^5$ nodes, so oversmoothing—not insufficient neighbourhood size—is
+the risk the residual+JK design addresses.
 
 Smoke / short run:
 
@@ -236,10 +272,11 @@ Smoke / short run:
 uv run python gnn_vsbm.py --epochs 1 --max-updates 5 --minibatch 1024 --seed 0 --layers 2
 ```
 
-Longer training (defaults: $K=729$, $d=32$, $L=2$):
+Longer training (defaults: $K=729$, $d=32$, $L=2$, `bfs_frac`$=0.5$):
 
 ```bash
-uv run python gnn_vsbm.py --epochs 20 --minibatch 2048 --lr 0.01 --seed 0 --out-prefix gnn
+uv run python gnn_vsbm.py --epochs 20 --minibatch 2048 --lr 0.01 --bfs-frac 1.0 \
+  --likelihood nb --seed 0 --out-prefix gnn
 ```
 
 ### PCA + $k$-means baseline
@@ -295,8 +332,22 @@ That is $14$ HP runs with the control enabled, plus $3\times2=6$ multi-seed
 finals. `--bfs-seeds` (default $4$) is shared and not swept. Lean GNN$_e$ grid:
 $L\in\{0,1,2\}$,
 $d\in\{32,64\}$, $d_e{=}16$, $\mathrm{lr}\in\{0.005,0.01\}$, $e_{\mathrm{wd}}{=}10^{-2}$.
-NTAC defaults: $K{=}729$, $R{=}12$, $T{=}0.1$ (paper). Optional α-GNN grid:
-$L\in\{0,1,2,4\}$, $d\in\{32,64\}$, $\mathrm{lr}\in\{0.005,0.01\}$.
+NTAC defaults: $K{=}729$, $R{=}12$, $T{=}0.1$ (paper).
+
+Lean GNN-vSBM grid (`--methods gnn`), sized by the subgraph-local per-step cost,
+which is within $\approx 1.2\times$ of LV:
+
+```bash
+--gnn-layers 0 1 2 4 --gnn-dims 64 --gnn-lrs 0.01 0.05 \
+--gnn-bfs-fracs 1.0 --gnn-likelihoods bernoulli poisson nb
+```
+
+$4\times1\times2\times1\times3=24$ HP runs plus $3$ multi-seed finals. `bfs_frac`
+is pinned at $1$ because a subgraph-local GNN needs a non-degenerate block
+(above); $d$ is pinned at the LV optimum because $L$ and the likelihood are the
+two axes specific to this model; $L{=}0$ is the in-code LV control (JK over hop
+$0$ only); and $\mathrm{lr}$ is swept because at $\mathrm{lr}=0.01$ the learned
+$\gamma$ stays near $10^{-2}$ after three epochs, i.e. the GNN barely switches on.
 
 
 ## End-to-end workflow
