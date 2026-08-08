@@ -188,6 +188,16 @@ def main() -> None:
         default=True,
         help="Stop Studio from inside the remote job when it finishes (safe if laptop closes).",
     )
+    parser.add_argument(
+        "--keep-auto-sleep",
+        action="store_true",
+        help=(
+            "Leave Studio idle auto-sleep enabled. The default disables it: a detached "
+            "nohup sweep does not reliably register as activity, and auto-sleep has "
+            "already killed one multi-hour run mid-way. The Studio is still stopped at "
+            "the end by --remote-stop-after."
+        ),
+    )
     parser.add_argument("--poll-seconds", type=int, default=120)
     parser.add_argument(
         "--detach-only",
@@ -208,8 +218,13 @@ def main() -> None:
         user=user,
         create_ok=True,
     )
+    if not args.keep_auto_sleep:
+        print(f"auto_sleep={studio.auto_sleep} (idle_timeout={studio.auto_sleep_time}s); disabling")
+        studio.auto_sleep = False
+        if studio.auto_sleep:
+            raise SystemExit("Could not disable auto-sleep; refusing to start a long sweep")
     studio.start(machine)
-    print(f"Studio ready on {studio.machine}")
+    print(f"Studio ready on {studio.machine} (auto_sleep={studio.auto_sleep})")
 
     try:
         if not args.skip_upload:

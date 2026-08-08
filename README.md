@@ -390,6 +390,17 @@ The launcher now defaults to `--methods lv lv_e` with `--epochs 15
 --final-epochs 40`, matching the sampler / likelihood grid above; pass
 `--methods pca lv lv_e gnn_e` to restore the previous full sweep.
 
+**Auto-sleep.** The Studio ships with idle auto-sleep enabled at the platform
+default, and a detached `nohup` sweep does not reliably register as activity: an
+earlier NTAC sweep was stopped mid-run, losing a seed and the `final_summary`
+artifacts. The launcher therefore sets `studio.auto_sleep = False` before
+starting the machine and aborts if the setting does not take, since a silent kill
+several hours in is far more expensive than a failed launch. Billing still ends
+on completion because `--remote-stop-after` stops the Studio from inside the
+remote job on any exit code; the residual exposure is a Studio left running if
+that wrapper itself is killed, so check the Studio state after a sweep that ends
+abnormally. Pass `--keep-auto-sleep` to opt out.
+
 
 Omit `--detach-only` to poll from the client and download artifacts when done
 (requires the laptop to stay online). Use `--skip-upload` on restarts if the Studio
