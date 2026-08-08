@@ -596,6 +596,30 @@ whole has not collapsed within twelve epochs. Its bias also drifts furthest from
 the base-rate logit, to $-5.21$. Twelve epochs of not-yet-diverging is not a
 guarantee; `fixed` has one by construction.
 
+**The finding is not specific to $d=256$.** Repeating `none` / `fixed` /
+`learned` at $d=64$, the best-performing width, gives the same verdict:
+
+| | $\max\lvert\eta\rvert$ by epoch | best ep | best LL / AUC | best Hungarian | last LL / AUC | last Hungarian |
+| --- | --- | --- | --- | --- | --- | --- |
+| `none` | $10,\,14,\,17,\,37,\,\ldots,\,314,\,489,\,622$ | $7$ | $-2.302$ / $0.892$ | $6\,355$ | $-6.235$ / $0.537$ | $7\,131$ |
+| `unit` `fixed` $8$ | $13.0$, then $10.7$–$13.1$ | $11$ | $-2.061$ / $0.944$ | $12\,317$ | $-2.061$ / $0.944$ | $12\,317$ |
+| `unit` `learned` $8$ | $10.0$–$17.1$, no trend | $11$ | $-2.077$ / $0.943$ | $12\,416$ | $-2.077$ / $0.943$ | $12\,416$ |
+
+The narrower control dies *slower* but no less completely: it climbs to AUC
+$0.899$ at epoch $8$ before $\max|\eta|$ accelerates through $314 \to 489 \to
+622$ and the held-out likelihood falls to $-6.235$. Width sets the rate of the
+runaway, not whether it happens — which is why $d=64$ looked healthy at the
+$15$-epoch HP horizon (AUC $0.912$) and still returned AUC $0.537$–$0.548$ in the
+$40$-epoch finals. The constrained arms land within $0.002$ AUC of their $d=256$
+counterparts, so the constraint is what buys stability, not the rank.
+
+The learned scale reproduces its $d=256$ behaviour closely: $8 \to 4.40$ at
+epoch $0$, then up to $10.70$ at epoch $11$, against $5.38 \to 11.01$ at
+$d=256$. Two widths converging on $s\approx11$ is the strongest available
+evidence that the scale is finding a property of the data rather than drifting.
+The bias likewise stays put, at $-7.48$ (fixed) and $-8.21$ (learned) against
+the control's $-11.99$.
+
 **Selection now costs rather than saves.** Under normalisation the *last* epoch
 outscores the restored best-`val_ll` checkpoint on both AUC and Hungarian
 ($11\,126$ against $10\,152$ fixed; $12\,027$ against $10\,854$ learned;
@@ -603,7 +627,9 @@ $12\,446$ against $12\,039$ per-row). The
 best-checkpoint machinery exists to salvage diverged runs; on a training curve
 that no longer collapses it gives up a little agreement instead. This is the
 same `val_metric`-versus-Hungarian anti-correlation reported above, now visible
-in a regime where the run is healthy.
+in a regime where the run is healthy. It is also mild rather than structural: at
+$d=64$ the best-`val_ll` epoch *is* the last epoch for both constrained arms, so
+the gap is a $d=256$ artefact and not a property of normalisation.
 
 **Is the bias still free?** Yes, deliberately: it is the only unbounded term
 left in the decoder and it carries the base rate, which the model has no other
