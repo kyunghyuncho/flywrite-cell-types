@@ -22,7 +22,12 @@ from pathlib import Path
 from lightning_sdk import Machine, Studio
 
 from heldout import LIKELIHOODS
-from training_utils import LABEL_SMOOTHING_TARGETS
+from training_utils import (
+    DEFAULT_U_SCALE_INIT,
+    LABEL_SMOOTHING_TARGETS,
+    U_NORMS,
+    U_SCALES,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent
 REMOTE_LOG = "unsup_sweep.log"
@@ -166,6 +171,18 @@ def main() -> None:
     )
     parser.add_argument("--lv-e-label-smoothings", type=float, nargs="+", default=[0.0])
     parser.add_argument("--gnn-label-smoothings", type=float, nargs="+", default=[0.0])
+    for flag in ("lv", "lv-e", "gnn"):
+        parser.add_argument(
+            f"--{flag}-u-norms",
+            nargs="+",
+            choices=U_NORMS,
+            default=["none"],
+            help="Block-embedding constraint grid; 'none' keeps the unbounded decoder",
+        )
+        parser.add_argument(f"--{flag}-u-scales", nargs="+", choices=U_SCALES, default=["fixed"])
+        parser.add_argument(
+            f"--{flag}-u-scale-inits", type=float, nargs="+", default=[DEFAULT_U_SCALE_INIT]
+        )
     parser.add_argument(
         "--label-smoothing-target",
         choices=LABEL_SMOOTHING_TARGETS,
@@ -300,6 +317,15 @@ def main() -> None:
             f"--lv-e-label-smoothings {join_nums(args.lv_e_label_smoothings)} "
             f"--gnn-label-smoothings {join_nums(args.gnn_label_smoothings)} "
             f"--label-smoothing-target {args.label_smoothing_target} "
+            f"--lv-u-norms {join_nums(args.lv_u_norms)} "
+            f"--lv-u-scales {join_nums(args.lv_u_scales)} "
+            f"--lv-u-scale-inits {join_nums(args.lv_u_scale_inits)} "
+            f"--lv-e-u-norms {join_nums(args.lv_e_u_norms)} "
+            f"--lv-e-u-scales {join_nums(args.lv_e_u_scales)} "
+            f"--lv-e-u-scale-inits {join_nums(args.lv_e_u_scale_inits)} "
+            f"--gnn-u-norms {join_nums(args.gnn_u_norms)} "
+            f"--gnn-u-scales {join_nums(args.gnn_u_scales)} "
+            f"--gnn-u-scale-inits {join_nums(args.gnn_u_scale_inits)} "
             f"--lv-control-updates {args.lv_control_updates} "
             f"--gnn-layers {join_nums(args.gnn_layers)} --gnn-dims {join_nums(args.gnn_dims)} "
             f"--gnn-lrs {join_nums(args.gnn_lrs)} "

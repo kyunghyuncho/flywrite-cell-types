@@ -43,7 +43,11 @@ at both that checkpoint (``gt_*``) and the final epoch (``last_gt_*``) as a
 diagnostic that never feeds selection. ``--label-smoothing`` is offered here for
 parity with those trainers: it caps the optimal Bernoulli logit at a finite
 value, applies to the **training loss only**, and is inert under the count
-likelihoods.
+likelihoods. So is ``--u-norm unit``, which normalises the low-rank prototypes
+``u_src`` / ``u_tgt`` in the forward pass and bounds the *bilinear* part of
+``eta_ij`` by the scale; the residual GNN term ``gamma * (h_i · h_j)`` is left
+free, so here the bound is partial. ``--u-norm none`` (the default) is the
+historical decoder.
 """
 
 from __future__ import annotations
@@ -81,13 +85,19 @@ from subgraph_sampler import SubgraphBatchSampler
 from training_utils import (
     LABEL_SMOOTHING_TARGETS,
     BestCheckpoint,
+    add_u_norm_arguments,
+    block_scale_metrics,
     checkpoint_metrics,
+    decoder_line,
     label_smoothing_line,
+    make_block_scale,
     prefixed,
     resolve_grad_clip,
     resolve_label_smoothing,
     safe_optimizer_step,
+    scaled_block_embeddings,
     smooth_binary_targets,
+    u_norm_line,
 )
 
 
@@ -256,6 +266,9 @@ class GNNvSBM(nn.Module):
         edge_bias_init: float,
         dtype: torch.dtype,
         gamma_init: float = 0.0,
+        u_norm: str = "none",
+        u_scale: str = "fixed",
+        u_scale_init: float = 1.0,
     ):
         super().__init__()
         self.n = n
@@ -278,6 +291,15 @@ class GNNvSBM(nn.Module):
         self.gamma = nn.Parameter(torch.tensor([gamma_init], dtype=dtype))
         # Negative-binomial dispersion; only optimized under --likelihood nb.
         self.log_r = nn.Parameter(torch.zeros(1, dtype=dtype))
+        # Parameters are tracked only when assigned directly as attributes, so the
+        # scale is registered here even though it is held by a plain helper object.
+        self.block_scale = make_block_scale(u_norm, u_scale, u_scale_init, k, dtype, "cpu")
+        if self.block_scale is not None and self.block_scale.log_scale is not None:
+            self.u_log_scale = self.block_scale.log_scale
+
+    def prototypes(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Low-rank prototypes as they enter the decoder, normalised if requested."""
+        return scaled_block_embeddings(self.u_src, self.u_tgt, self.block_scale)
 
     def soft_assignments(self, idx: torch.Tensor | None = None) -> torch.Tensor:
         logits = self.q_logits if idx is None else self.q_logits[idx]
@@ -329,7 +351,8 @@ class GNNvSBM(nn.Module):
         h_tgt: torch.Tensor,
     ) -> torch.Tensor:
         """Dense $|S|\\times|S|$ predictor from block-local assignments/embeddings."""
-        lv = (alpha @ self.u_src) @ (alpha @ self.u_tgt).T
+        u_src, u_tgt = self.prototypes()
+        lv = (alpha @ u_src) @ (alpha @ u_tgt).T
         return lv + self.bias + self.gamma * (h_src @ h_tgt.T)
 
     def edge_logits(
@@ -342,7 +365,8 @@ class GNNvSBM(nn.Module):
         """Dense block predictor from full-graph embeddings (``--propagation full``)."""
         alpha_i = self.soft_assignments(idx_i)
         alpha_j = self.soft_assignments(idx_j)
-        lv = (alpha_i @ self.u_src) @ (alpha_j @ self.u_tgt).T
+        u_src, u_tgt = self.prototypes()
+        lv = (alpha_i @ u_src) @ (alpha_j @ u_tgt).T
         gnn = h_src[idx_i] @ h_tgt[idx_j].T
         return lv + self.bias + self.gamma * gnn
 
@@ -356,7 +380,8 @@ class GNNvSBM(nn.Module):
         """Per-pair logits for held-out evaluation (not a dense block)."""
         alpha_s = self.soft_assignments(src)
         alpha_t = self.soft_assignments(tgt)
-        lv = ((alpha_s @ self.u_src) * (alpha_t @ self.u_tgt)).sum(dim=-1)
+        u_src, u_tgt = self.prototypes()
+        lv = ((alpha_s @ u_src) * (alpha_t @ u_tgt)).sum(dim=-1)
         gnn = (h_src[src] * h_tgt[tgt]).sum(dim=-1)
         return lv + self.bias + self.gamma * gnn
 
@@ -425,7 +450,11 @@ def train(args: argparse.Namespace) -> dict:
         edge_bias_init=edge_bias_init,
         dtype=dtype,
         gamma_init=args.gamma_init,
+        u_norm=args.u_norm,
+        u_scale=args.u_scale,
+        u_scale_init=args.u_scale_init,
     ).to(device=device, dtype=dtype)
+    print(u_norm_line(args.u_norm, model.block_scale, edge_bias_init))
 
     params = [p for name, p in model.named_parameters() if name != "log_r"]
     if args.likelihood == "nb":
@@ -549,6 +578,7 @@ def train(args: argparse.Namespace) -> dict:
                 n_used = int(torch.unique(torch.argmax(model.q_logits, dim=-1)).numel())
                 gamma = float(model.gamma.item())
             print(f"[gamma] epoch={epoch} gamma={gamma:.6f}")
+            print(decoder_line(epoch, float(model.bias.item()), model.block_scale))
             print(
                 f"loss={mean_loss:.4f} val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
                 f"best_val_ll={checkpoint.metric:.6f}@{checkpoint.epoch} gamma={gamma:.6f} "
@@ -677,6 +707,8 @@ def save_results(
     # Evaluate the final parameters before restoring, so the cost of any mid-run
     # divergence is measurable rather than inferred.
     last = snapshot()
+    last_scale = block_scale_metrics(model.block_scale, "last_")
+    last_bias = float(model.bias.item())
     restored = checkpoint.epoch != last_epoch and checkpoint.restore(state)
     best = snapshot() if restored else last
 
@@ -718,6 +750,13 @@ def save_results(
         "label_smoothing": args.label_smoothing,
         "label_smoothing_target": args.label_smoothing_target,
         "label_smoothing_applied": label_smoothing > 0.0,
+        "u_norm": args.u_norm,
+        "u_scale": args.u_scale,
+        "u_scale_init": args.u_scale_init,
+        **block_scale_metrics(model.block_scale),
+        **last_scale,
+        "decoder_bias": float(model.bias.item()),
+        "last_decoder_bias": last_bias,
         "train_base_rate": base_rate,
         "max_abs_train_logit": max_abs_eta,
         "edges_seen_x_nnz": cum_pos_obs / max(nnz, 1),
@@ -807,6 +846,7 @@ def build_argparser() -> argparse.ArgumentParser:
             "marginal; 'uniform' (0.5) inflates negatives far above the true density"
         ),
     )
+    add_u_norm_arguments(p)
     p.add_argument(
         "--gt",
         default="root_id_type_dict.pkl",

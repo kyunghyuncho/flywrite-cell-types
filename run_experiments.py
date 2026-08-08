@@ -27,7 +27,12 @@ from scipy.sparse import load_npz
 
 from evaluate_clustering import evaluate_pair, load_assignment_dict, load_ground_truth
 from heldout import LIKELIHOODS, make_heldout_pairs, make_heldout_rows, save_heldout
-from training_utils import LABEL_SMOOTHING_TARGETS
+from training_utils import (
+    DEFAULT_U_SCALE_INIT,
+    LABEL_SMOOTHING_TARGETS,
+    U_NORMS,
+    U_SCALES,
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,58 @@ def smoothing_tag(eps: float) -> str:
 
 def smoothing_flags(eps: float, target: str) -> list[str]:
     return ["--label-smoothing", str(eps), "--label-smoothing-target", target]
+
+
+# One sweep point for the block-logit constraint: the scale and its
+# initialisation, which only exist under ``--u-norm unit``.
+UNorm = tuple[str, str, float]
+
+
+def u_norm_settings(norms: list[str], scales: list[str], inits: list[float]) -> list[UNorm]:
+    """Deduplicated $(\\texttt{u\\_norm}, \\texttt{u\\_scale}, s_0)$ grid points.
+
+    The scale is inert under ``--u-norm none``, so the product is collapsed
+    there rather than running the identical unconstrained configuration once per
+    scale parameterisation.
+    """
+    settings: list[UNorm] = []
+    for norm in norms:
+        candidates = (
+            [(norm, scales[0], float(inits[0]))]
+            if norm == "none"
+            else [(norm, s, float(i)) for s in scales for i in inits]
+        )
+        settings.extend(c for c in candidates if c not in settings)
+    return settings
+
+
+def u_norm_tag(setting: UNorm) -> str:
+    """Run-name suffix, empty for the unconstrained decoder.
+
+    As with ``smoothing_tag``, the default arm keeps the prefixes every existing
+    artefact was written under, so ``--skip-existing`` stays valid.
+    """
+    u_norm, u_scale, init = setting
+    return "" if u_norm == "none" else f"_unit_{u_scale}{init}"
+
+
+def u_norm_flags(setting: UNorm) -> list[str]:
+    u_norm, u_scale, init = setting
+    return ["--u-norm", u_norm, "--u-scale", u_scale, "--u-scale-init", str(init)]
+
+
+def u_norm_hyperparams(setting: UNorm) -> dict:
+    u_norm, u_scale, init = setting
+    return {"u_norm": u_norm, "u_scale": u_scale, "u_scale_init": init}
+
+
+def u_norm_of(hp: dict) -> UNorm:
+    """Recover a sweep point from a selected hyperparameter record."""
+    return (
+        str(hp.get("u_norm", "none")),
+        str(hp.get("u_scale", "fixed")),
+        float(hp.get("u_scale_init", DEFAULT_U_SCALE_INIT)),
+    )
 
 
 def run_cmd(cmd: list[str]) -> None:
@@ -121,73 +178,87 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                 )
 
     if "lv" in methods:
-        for d in args.lv_dims:
-            for lr in args.lv_lrs:
-                for bfs_frac in args.lv_bfs_fracs:
-                    for likelihood in args.lv_likelihoods:
-                        for eps in args.lv_label_smoothings:
-                            name = (
-                                f"hp_lv_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}{smoothing_tag(eps)}"
-                            )
-                            prefix = name
-                            specs.append(
-                                RunSpec(
-                                    name=name,
-                                    method="lv",
-                                    prefix=prefix,
-                                    hyperparams={
-                                        "d": d,
-                                        "lr": lr,
-                                        "bfs_frac": bfs_frac,
-                                        "likelihood": likelihood,
-                                        "label_smoothing": eps,
-                                    },
-                                    command=[
-                                        py,
-                                        "train_lv_vsbm.py",
-                                        "--k",
-                                        str(args.k),
-                                        "--d",
-                                        str(d),
-                                        "--lr",
-                                        str(lr),
-                                        "--bfs-frac",
-                                        str(bfs_frac),
-                                        "--bfs-seeds",
-                                        str(args.bfs_seeds),
-                                        "--likelihood",
-                                        likelihood,
-                                        "--grad-clip",
-                                        str(args.grad_clip),
-                                        *smoothing_flags(eps, args.label_smoothing_target),
-                                        "--epochs",
-                                        str(args.epochs),
-                                        "--minibatch",
-                                        str(args.minibatch),
-                                        "--seed",
-                                        str(args.split_seed),
-                                        "--device",
-                                        args.device,
-                                        "--heldout-pairs",
-                                        args.heldout_pairs,
-                                        "--out-prefix",
-                                        prefix,
-                                    ],
-                                )
-                            )
+        # Flattened with ``product`` for the same reason as ``lv_e`` below: the
+        # grid has grown past the depth at which nested ``for`` blocks leave room
+        # for the command list.
+        lv_grid = product(
+            args.lv_dims,
+            args.lv_lrs,
+            args.lv_bfs_fracs,
+            args.lv_likelihoods,
+            args.lv_label_smoothings,
+            u_norm_settings(args.lv_u_norms, args.lv_u_scales, args.lv_u_scale_inits),
+        )
+        for d, lr, bfs_frac, likelihood, eps, u_setting in lv_grid:
+            name = (
+                f"hp_lv_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}"
+                f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}"
+            )
+            specs.append(
+                RunSpec(
+                    name=name,
+                    method="lv",
+                    prefix=name,
+                    hyperparams={
+                        "d": d,
+                        "lr": lr,
+                        "bfs_frac": bfs_frac,
+                        "likelihood": likelihood,
+                        "label_smoothing": eps,
+                        **u_norm_hyperparams(u_setting),
+                    },
+                    command=[
+                        py,
+                        "train_lv_vsbm.py",
+                        "--k",
+                        str(args.k),
+                        "--d",
+                        str(d),
+                        "--lr",
+                        str(lr),
+                        "--bfs-frac",
+                        str(bfs_frac),
+                        "--bfs-seeds",
+                        str(args.bfs_seeds),
+                        "--likelihood",
+                        likelihood,
+                        "--grad-clip",
+                        str(args.grad_clip),
+                        *smoothing_flags(eps, args.label_smoothing_target),
+                        *u_norm_flags(u_setting),
+                        "--epochs",
+                        str(args.epochs),
+                        "--minibatch",
+                        str(args.minibatch),
+                        "--seed",
+                        str(args.split_seed),
+                        "--device",
+                        args.device,
+                        "--heldout-pairs",
+                        args.heldout_pairs,
+                        "--out-prefix",
+                        name,
+                    ],
+                )
+            )
 
     if "lv" in methods and args.lv_control_updates:
         # A coverage-defined epoch is longer at higher bfs_frac, so the epoch-matched
         # grid above also hands the BFS arms more gradient steps. This control gives
         # uniform sampling the same update budget, separating the two effects.
-        # One dim, one likelihood and one smoothing level suffice: the control
-        # isolates the sampler, not the rank, the observation model or the target
-        # form, and each control costs as much as a BFS run.
+        # One dim, one likelihood, one smoothing level and one block-logit
+        # constraint suffice: the control isolates the sampler, not the rank, the
+        # observation model, the target form or the decoder parameterisation, and
+        # each control costs as much as a BFS run.
+        u_setting = u_norm_settings(args.lv_u_norms, args.lv_u_scales, args.lv_u_scale_inits)[0]
         for d in args.lv_dims[:1]:
             for lr in args.lv_lrs:
                 for likelihood in args.lv_likelihoods[:1]:
                     eps = args.lv_label_smoothings[0]
-                    name = f"hp_lv_control_d{d}_lr{lr}_{likelihood}{smoothing_tag(eps)}"
+                    name = (
+                        f"hp_lv_control_d{d}_lr{lr}_{likelihood}"
+                        f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}"
+                    )
                     specs.append(
                         RunSpec(
                             name=name,
@@ -200,6 +271,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                 "likelihood": likelihood,
                                 "label_smoothing": eps,
                                 "target_updates": args.lv_control_updates,
+                                **u_norm_hyperparams(u_setting),
                             },
                             command=[
                                 py,
@@ -219,6 +291,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                 "--grad-clip",
                                 str(args.grad_clip),
                                 *smoothing_flags(eps, args.label_smoothing_target),
+                                *u_norm_flags(u_setting),
                                 "--target-updates",
                                 str(args.lv_control_updates),
                                 "--epochs",
@@ -248,11 +321,12 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
             args.lv_e_bfs_fracs,
             args.lv_e_likelihoods,
             args.lv_e_label_smoothings,
+            u_norm_settings(args.lv_e_u_norms, args.lv_e_u_scales, args.lv_e_u_scale_inits),
         )
-        for d, d_e, lr, e_wd, bfs_frac, likelihood, eps in lv_e_grid:
+        for d, d_e, lr, e_wd, bfs_frac, likelihood, eps, u_setting in lv_e_grid:
             name = (
                 f"hp_lv_e_d{d}_de{d_e}_lr{lr}_ewd{e_wd}"
-                f"_bfs{bfs_frac}_{likelihood}{smoothing_tag(eps)}"
+                f"_bfs{bfs_frac}_{likelihood}{smoothing_tag(eps)}{u_norm_tag(u_setting)}"
             )
             specs.append(
                 RunSpec(
@@ -267,6 +341,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         "bfs_frac": bfs_frac,
                         "likelihood": likelihood,
                         "label_smoothing": eps,
+                        **u_norm_hyperparams(u_setting),
                     },
                     command=[
                         py,
@@ -290,6 +365,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         "--grad-clip",
                         str(args.grad_clip),
                         *smoothing_flags(eps, args.label_smoothing_target),
+                        *u_norm_flags(u_setting),
                         "--epochs",
                         str(args.epochs),
                         "--minibatch",
@@ -314,9 +390,13 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
             args.gnn_bfs_fracs,
             args.gnn_likelihoods,
             args.gnn_label_smoothings,
+            u_norm_settings(args.gnn_u_norms, args.gnn_u_scales, args.gnn_u_scale_inits),
         )
-        for layers, d, lr, bfs_frac, likelihood, eps in gnn_grid:
-            name = f"hp_gnn_L{layers}_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}{smoothing_tag(eps)}"
+        for layers, d, lr, bfs_frac, likelihood, eps, u_setting in gnn_grid:
+            name = (
+                f"hp_gnn_L{layers}_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}"
+                f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}"
+            )
             specs.append(
                 RunSpec(
                     name=name,
@@ -329,6 +409,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         "bfs_frac": bfs_frac,
                         "likelihood": likelihood,
                         "label_smoothing": eps,
+                        **u_norm_hyperparams(u_setting),
                     },
                     command=[
                         py,
@@ -352,6 +433,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         "--grad-clip",
                         str(args.grad_clip),
                         *smoothing_flags(eps, args.label_smoothing_target),
+                        *u_norm_flags(u_setting),
                         "--epochs",
                         str(args.epochs),
                         "--minibatch",
@@ -490,9 +572,10 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                 control = hp.get("target_updates")
                 tag = "control" if control else f"bfs{hp['bfs_frac']}"
                 eps = float(hp.get("label_smoothing", 0.0))
+                u_setting = u_norm_of(hp)
                 name = (
                     f"final_lv_d{hp['d']}_lr{hp['lr']}_{tag}_{hp['likelihood']}"
-                    f"{smoothing_tag(eps)}_seed{seed}"
+                    f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}_seed{seed}"
                 )
                 cmd = [
                     py,
@@ -512,6 +595,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     "--grad-clip",
                     str(args.grad_clip),
                     *smoothing_flags(eps, args.label_smoothing_target),
+                    *u_norm_flags(u_setting),
                     "--minibatch",
                     str(args.minibatch),
                     "--seed",
@@ -531,9 +615,11 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     cmd += ["--epochs", str(args.final_epochs)]
             elif method == "lv_e":
                 eps = float(hp.get("label_smoothing", 0.0))
+                u_setting = u_norm_of(hp)
                 name = (
                     f"final_lv_e_d{hp['d']}_de{hp['d_e']}_lr{hp['lr']}_ewd{hp['e_wd']}_"
-                    f"bfs{hp['bfs_frac']}_{hp['likelihood']}{smoothing_tag(eps)}_seed{seed}"
+                    f"bfs{hp['bfs_frac']}_{hp['likelihood']}"
+                    f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}_seed{seed}"
                 )
                 cmd = [
                     py,
@@ -557,6 +643,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     "--grad-clip",
                     str(args.grad_clip),
                     *smoothing_flags(eps, args.label_smoothing_target),
+                    *u_norm_flags(u_setting),
                     "--epochs",
                     str(args.final_epochs),
                     "--minibatch",
@@ -605,9 +692,11 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                 ]
             elif method == "gnn":
                 eps = float(hp.get("label_smoothing", 0.0))
+                u_setting = u_norm_of(hp)
                 name = (
                     f"final_gnn_L{hp['layers']}_d{hp['d']}_lr{hp['lr']}_"
-                    f"bfs{hp['bfs_frac']}_{hp['likelihood']}{smoothing_tag(eps)}_seed{seed}"
+                    f"bfs{hp['bfs_frac']}_{hp['likelihood']}"
+                    f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}_seed{seed}"
                 )
                 cmd = [
                     py,
@@ -631,6 +720,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     "--grad-clip",
                     str(args.grad_clip),
                     *smoothing_flags(eps, args.label_smoothing_target),
+                    *u_norm_flags(u_setting),
                     "--epochs",
                     str(args.final_epochs),
                     "--minibatch",
@@ -699,6 +789,11 @@ DIAGNOSTIC_KEYS = (
     "label_smoothing",
     "label_smoothing_target",
     "label_smoothing_applied",
+    "u_scale_value",
+    "u_scale_value_max",
+    "last_u_scale_value",
+    "decoder_bias",
+    "last_decoder_bias",
     "max_abs_train_logit",
     "skipped_updates",
 )
@@ -813,6 +908,31 @@ def main() -> None:
     p.add_argument(
         "--gnn-label-smoothings", type=float, nargs="+", default=[0.0], help="GNN smoothing grid"
     )
+    for method, flag in (("LV", "lv"), ("LV+e", "lv-e"), ("GNN", "gnn")):
+        p.add_argument(
+            f"--{flag}-u-norms",
+            nargs="+",
+            choices=U_NORMS,
+            default=["none"],
+            help=(
+                f"{method} block-embedding constraint grid; 'none' (default) keeps the "
+                "unbounded bilinear decoder and the historical run names"
+            ),
+        )
+        p.add_argument(
+            f"--{flag}-u-scales",
+            nargs="+",
+            choices=U_SCALES,
+            default=["fixed"],
+            help=f"{method} scale parameterisation grid, swept only under u_norm=unit",
+        )
+        p.add_argument(
+            f"--{flag}-u-scale-inits",
+            type=float,
+            nargs="+",
+            default=[DEFAULT_U_SCALE_INIT],
+            help=f"{method} scale value / initialisation grid, swept only under u_norm=unit",
+        )
     p.add_argument(
         "--label-smoothing-target",
         choices=LABEL_SMOOTHING_TARGETS,
@@ -918,6 +1038,7 @@ def main() -> None:
                 hp["bfs_frac"] = float(best["bfs_frac"])
                 hp["likelihood"] = str(best["likelihood"])
                 hp["label_smoothing"] = float(best.get("label_smoothing", 0.0))
+                hp.update(u_norm_hyperparams(u_norm_of(best)))
             if method == "lv" and best.get("target_updates"):
                 # Carry the matched-compute budget so a selected control stays a
                 # control in the finals instead of reverting to epoch matching.

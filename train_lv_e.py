@@ -21,6 +21,12 @@ agreement is recorded at both that checkpoint (``gt_*``) and the final epoch
 likewise behaves as it does there: it caps the optimal Bernoulli logit at a
 finite value, applies to the **training loss only**, and is inert under the
 count likelihoods.
+
+``--u-norm unit`` bounds the *cluster* part of the logit by normalising the
+prototypes in the forward pass, giving $|(\\alpha_i U_s)\\cdot(\\alpha_j U_t)|
+\\le s$. Note that here it is only a partial guarantee: the residual term
+$e_i\\cdot e_j$ is left unconstrained, and is held in check by ``--e-wd``
+instead. ``--u-norm none`` (the default) changes nothing.
 """
 
 from __future__ import annotations
@@ -57,13 +63,20 @@ from subgraph_sampler import SubgraphBatchSampler
 from training_utils import (
     LABEL_SMOOTHING_TARGETS,
     BestCheckpoint,
+    BlockScale,
+    add_u_norm_arguments,
+    block_scale_metrics,
     checkpoint_metrics,
+    decoder_line,
     label_smoothing_line,
+    make_block_scale,
     prefixed,
     resolve_grad_clip,
     resolve_label_smoothing,
     safe_optimizer_step,
+    scaled_block_embeddings,
     smooth_binary_targets,
+    u_norm_line,
 )
 
 
@@ -140,6 +153,7 @@ def eval_heldout(
     device: str,
     dtype: torch.dtype,
     chunk: int = 8192,
+    scale: BlockScale | None = None,
 ) -> tuple[float, float, float]:
     """Held-out (Bernoulli LL, native LL, AUC) for the fitted model.
 
@@ -150,6 +164,7 @@ def eval_heldout(
     comparable across every run ever made, smoothed or not.
     """
     alpha = torch.softmax(q_logits, dim=-1)
+    eff_left, eff_right = scaled_block_embeddings(u_left, u_right, scale)
     src = held["src"]
     tgt = held["tgt"]
     y = torch.tensor(held["y"], dtype=dtype, device=device)
@@ -161,7 +176,7 @@ def eval_heldout(
         sl = slice(start, start + chunk)
         ai = alpha[src[sl]]
         aj = alpha[tgt[sl]]
-        lv = ((ai @ u_left) * (aj @ u_right)).sum(dim=-1)
+        lv = ((ai @ eff_left) * (aj @ eff_right)).sum(dim=-1)
         resid = (e[src[sl]] * e[tgt[sl]]).sum(dim=-1)
         logits = lv + bias + resid
         edge_logit = pair_edge_logit(likelihood, logits, log_r)
@@ -213,10 +228,13 @@ def train(args: argparse.Namespace) -> dict:
         (0.01 / np.sqrt(args.d_e)) * torch.randn(n, args.d_e, dtype=dtype, device=device)
     )
     log_r = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
+    scale = make_block_scale(args.u_norm, args.u_scale, args.u_scale_init, args.k, dtype, device)
+    print(u_norm_line(args.u_norm, scale, float(bias.item())))
 
     dense_params = [u_left, u_right, bias, q_logits]
     if args.likelihood == "nb":
         dense_params.append(log_r)
+    dense_params += [] if scale is None else scale.parameters
     optimizer = torch.optim.Adam(
         [
             {"params": dense_params, "weight_decay": 0.0},
@@ -234,6 +252,8 @@ def train(args: argparse.Namespace) -> dict:
         "e": e,
         "log_r": log_r,
     }
+    if scale is not None and scale.log_scale is not None:
+        state["log_scale"] = scale.log_scale
     sampler = SubgraphBatchSampler(
         adj,
         batch_size=args.minibatch,
@@ -283,7 +303,8 @@ def train(args: argparse.Namespace) -> dict:
 
                 idx_t = torch.from_numpy(idx).to(device)
                 q = torch.softmax(q_logits[idx_t], dim=-1)
-                lv = (q @ u_left) @ (q @ u_right).T
+                eff_left, eff_right = scaled_block_embeddings(u_left, u_right, scale)
+                lv = (q @ eff_left) @ (q @ eff_right).T
                 resid = e[idx_t] @ e[idx_t].T
                 logits = lv + bias + resid
                 epoch_max_abs_eta = max(
@@ -322,11 +343,13 @@ def train(args: argparse.Namespace) -> dict:
                 args.likelihood,
                 device,
                 dtype,
+                scale=scale,
             )
             checkpoint.update(val_ll, epoch, state)
             with torch.no_grad():
                 n_used = int(torch.unique(torch.argmax(q_logits, dim=-1)).numel())
                 e_rms = float(torch.sqrt(torch.mean(e * e)).item())
+            print(decoder_line(epoch, float(bias.item()), scale))
             print(
                 f"loss={mean_loss:.4f} val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
                 f"best_val_ll={checkpoint.metric:.6f}@{checkpoint.epoch} "
@@ -355,6 +378,7 @@ def train(args: argparse.Namespace) -> dict:
                 args.likelihood,
                 device,
                 dtype,
+                scale=scale,
             )
             e_rms = float(torch.sqrt(torch.mean(e * e)).item())
         pred = {mapping[i]: int(assignments[i]) for i in range(len(assignments))}
@@ -372,6 +396,8 @@ def train(args: argparse.Namespace) -> dict:
     # Evaluate the final parameters before restoring, so the cost of any mid-run
     # divergence is measurable rather than inferred.
     last = snapshot()
+    last_scale = block_scale_metrics(scale, "last_")
+    last_bias = float(bias.item())
     restored = checkpoint.epoch != last_epoch and checkpoint.restore(state)
     best = snapshot() if restored else last
 
@@ -412,6 +438,13 @@ def train(args: argparse.Namespace) -> dict:
         "label_smoothing": args.label_smoothing,
         "label_smoothing_target": args.label_smoothing_target,
         "label_smoothing_applied": label_smoothing > 0.0,
+        "u_norm": args.u_norm,
+        "u_scale": args.u_scale,
+        "u_scale_init": args.u_scale_init,
+        **block_scale_metrics(scale),
+        **last_scale,
+        "decoder_bias": float(bias.item()),
+        "last_decoder_bias": last_bias,
         "train_base_rate": base_rate,
         "max_abs_train_logit": max_abs_eta,
         "edges_seen_x_nnz": cum_pos_obs / max(nnz, 1),
@@ -490,6 +523,7 @@ def build_argparser() -> argparse.ArgumentParser:
             "marginal; 'uniform' (0.5) inflates negatives far above the true density"
         ),
     )
+    add_u_norm_arguments(p)
     p.add_argument(
         "--gt",
         default="root_id_type_dict.pkl",

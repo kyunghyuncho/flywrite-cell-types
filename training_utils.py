@@ -42,14 +42,33 @@ decoder therefore has somewhere to stop. The prior $p_0$ is selected by
 
 Smoothing is a Bernoulli device and is deliberately inert for the count
 likelihoods; see ``resolve_label_smoothing``.
+
+*Unbounded block logits.* Smoothing bounds the *optimum*; it does not bound the
+*iterate*. The block predictor $\\eta_{kk'} = u_k^\\top v_{k'} + b$ is bilinear
+in unconstrained embeddings, so nothing stops $\\lVert u_k\\rVert$ from growing:
+at $d=256$, $\\mathrm{lr}=0.1$ the observed $\\max|\\eta|$ runs $15 \\to 125 \\to
+1129 \\to 3030$ over four epochs, at which point float32 $\\sigma(\\eta)$ is
+exactly $0$ or $1$, every gradient is exactly zero and the parameters freeze.
+``unit_rows`` and ``BlockScale`` replace the bilinear form by a scaled cosine
+similarity,
+
+$$ \\eta_{kk'} = s\\,\\hat u_k^\\top \\hat v_{k'} + b,
+   \\qquad \\lVert\\hat u_k\\rVert = \\lVert\\hat v_{k'}\\rVert = 1, $$
+
+for which $|\\eta_{kk'} - b| \\le s$ holds *structurally* rather than as
+something the optimiser has to be persuaded of. Normalisation happens in the
+forward pass, so gradients flow through it and no post-hoc projection of the
+parameters is required.
 """
 
 from __future__ import annotations
 
+import argparse
 import math
 from collections.abc import Mapping, Sequence
 
 import torch
+from torch import nn
 
 
 def resolve_grad_clip(threshold: float | None) -> float | None:
@@ -170,6 +189,214 @@ def label_smoothing_line(eps: float, base_rate: float, target: str) -> str:
         f"label_smoothing={eps} target={target} p0={smoothing_prior(target, base_rate):.3e} "
         f"=> optimal logits bounded to [{lo:.3f}, {hi:.3f}]"
     )
+
+
+U_NORMS = ("none", "unit")
+U_SCALES = ("fixed", "learned", "per_row")
+
+# The bias carries the base rate, $b = \log(1.5\times10^{-4}) \approx -8.8$, and
+# the scale is the entire budget the decoder has for departing from it. A block
+# of density 0.1 sits at $\eta \approx -2.2$, i.e. $+6.6$ above $b$; the densest
+# blocks observed under BFS sampling need rather less. Eight logits of headroom
+# therefore spans the range the data actually occupy while capping $|\eta|$ near
+# $17$ -- an order of magnitude below where float32 $\sigma$ saturates, and two
+# orders below the values the unconstrained decoder reached.
+DEFAULT_U_SCALE_INIT = 8.0
+
+
+def unit_rows(u: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Row-wise $u/\\lVert u\\rVert$, differentiable and finite at $u=0$.
+
+    The guard lives *inside* the square root rather than as a clamp on the norm:
+    $u/\\max(\\lVert u\\rVert,\\varepsilon)$ is finite at the origin but its
+    gradient is not, whereas $u/\\sqrt{\\lVert u\\rVert^2+\\varepsilon}$ is smooth
+    everywhere and still satisfies $\\lVert\\hat u\\rVert \\le 1$, which is what
+    the logit bound rests on.
+    """
+    return u * torch.rsqrt(u.pow(2).sum(dim=-1, keepdim=True) + eps)
+
+
+class BlockScale:
+    """The positive scale $s$ multiplying unit-normalised cluster embeddings.
+
+    ``fixed``
+        $s$ is a constant. There is no parameter, hence nothing to diverge, and
+        $|\\eta_{kk'} - b| \\le s$ holds for the whole run.
+    ``learned``
+        A single scalar, carried as $\\log s$ so that $s>0$ by construction. The
+        bound becomes $|\\eta_{kk'} - b| \\le s_T$ for whatever $s_T$ the run
+        ends at, which is only useful if $s$ itself stays bounded -- hence
+        ``mean_value`` is logged every epoch.
+    ``per_row``
+        $K$ scalars, one per left cluster. This is a strictly weaker guarantee:
+        the ceiling is $\\max_k s_k$, so a single runaway row suffices to
+        reintroduce the saturation this construction exists to prevent.
+
+    The scale multiplies the left factor only, so $\\eta_{kk'} = s_k\\,\\hat
+    u_k^\\top\\hat v_{k'}$; for the scalar modes that is identical to scaling the
+    product.
+    """
+
+    def __init__(
+        self,
+        mode: str,
+        init: float,
+        k: int,
+        dtype: torch.dtype,
+        device: str | torch.device,
+    ) -> None:
+        if mode not in U_SCALES:
+            raise ValueError(f"unknown u-scale mode {mode!r}; expected one of {U_SCALES}")
+        if not init > 0.0:
+            raise ValueError(f"u-scale-init must be positive, got {init}")
+        self.mode = mode
+        self.init = float(init)
+        self.log_scale: nn.Parameter | None = None
+        if mode == "fixed":
+            return
+        rows = 1 if mode == "learned" else k
+        self.log_scale = nn.Parameter(
+            torch.full((rows, 1), math.log(self.init), dtype=dtype, device=device)
+        )
+
+    @property
+    def is_learnable(self) -> bool:
+        return self.log_scale is not None
+
+    @property
+    def parameters(self) -> list[nn.Parameter]:
+        return [] if self.log_scale is None else [self.log_scale]
+
+    def factor(self) -> torch.Tensor | float:
+        """Broadcastable multiplier of shape ``(1, 1)`` / ``(K, 1)``, or a constant."""
+        return self.init if self.log_scale is None else torch.exp(self.log_scale)
+
+    @torch.no_grad()
+    def values(self) -> torch.Tensor:
+        if self.log_scale is None:
+            return torch.tensor([self.init])
+        return torch.exp(self.log_scale.detach()).flatten().cpu()
+
+    def mean_value(self) -> float:
+        return float(self.values().mean().item())
+
+    def max_value(self) -> float:
+        return float(self.values().max().item())
+
+    def line(self) -> str:
+        if not self.is_learnable:
+            return f"u_scale={self.init:.4f}"
+        vals = self.values()
+        if vals.numel() == 1:
+            return f"u_scale={float(vals.item()):.4f}"
+        return (
+            f"u_scale_mean={float(vals.mean().item()):.4f} "
+            f"u_scale_min={float(vals.min().item()):.4f} "
+            f"u_scale_max={float(vals.max().item()):.4f}"
+        )
+
+
+def make_block_scale(
+    u_norm: str,
+    mode: str,
+    init: float,
+    k: int,
+    dtype: torch.dtype,
+    device: str | torch.device,
+) -> BlockScale | None:
+    """A ``BlockScale`` under ``--u-norm unit``, and ``None`` otherwise.
+
+    Returning ``None`` rather than a unit scale is deliberate: under
+    ``--u-norm none`` the decoder must execute the *same* arithmetic it always
+    has, not an algebraically equivalent rewrite of it.
+    """
+    if u_norm not in U_NORMS:
+        raise ValueError(f"unknown u-norm {u_norm!r}; expected one of {U_NORMS}")
+    if u_norm == "none":
+        return None
+    return BlockScale(mode, init, k, dtype, device)
+
+
+def scaled_block_embeddings(
+    u_left: torch.Tensor,
+    u_right: torch.Tensor,
+    scale: BlockScale | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Effective cluster embeddings entering the bilinear decoder.
+
+    With ``scale=None`` the inputs are returned untouched -- the unconstrained
+    path is bit-for-bit the historical one.
+    """
+    if scale is None:
+        return u_left, u_right
+    return unit_rows(u_left) * scale.factor(), unit_rows(u_right)
+
+
+def u_norm_line(u_norm: str, scale: BlockScale | None, bias_init: float) -> str:
+    """One-line description of the block-logit constraint, for the run header."""
+    if scale is None:
+        return f"u_norm=none (block logits unbounded; bias init {bias_init:.3f})"
+    s = scale.max_value()
+    return (
+        f"u_norm=unit u_scale={scale.mode} init={scale.init} "
+        f"=> |eta - b| <= {s:.3f}, eta in [{bias_init - s:.3f}, {bias_init + s:.3f}] "
+        f"at the initial bias"
+    )
+
+
+def decoder_line(epoch: int, bias: float, scale: BlockScale | None) -> str:
+    """Per-epoch state of the two terms that can still grow without bound."""
+    tail = "" if scale is None else f" {scale.line()}"
+    return f"[decoder] epoch={epoch} bias={bias:.4f}{tail}"
+
+
+def block_scale_metrics(scale: BlockScale | None, prefix: str = "") -> dict[str, float | None]:
+    """Realised scale, reported at whichever parameter state is current."""
+    if scale is None:
+        return {f"{prefix}u_scale_value": None, f"{prefix}u_scale_value_max": None}
+    return {
+        f"{prefix}u_scale_value": scale.mean_value(),
+        f"{prefix}u_scale_value_max": scale.max_value(),
+    }
+
+
+def add_u_norm_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Attach ``--u-norm`` / ``--u-scale`` / ``--u-scale-init`` to a trainer."""
+    parser.add_argument(
+        "--u-norm",
+        choices=U_NORMS,
+        default="none",
+        help=(
+            "Constraint on the cluster embeddings entering the block logit. "
+            "'none' (default) leaves them unconstrained, reproducing every run "
+            "made so far; 'unit' normalises each row in the forward pass, which "
+            "bounds |eta - bias| by the scale below"
+        ),
+    )
+    parser.add_argument(
+        "--u-scale",
+        choices=U_SCALES,
+        default="fixed",
+        help=(
+            "Parameterisation of the scale applied under --u-norm unit: a "
+            "constant ('fixed'), one learned scalar ('learned', carried as its "
+            "log so it stays positive), or K learned per-cluster scales "
+            "('per_row', whose ceiling is only max_k s_k). Inert under --u-norm none"
+        ),
+    )
+    parser.add_argument(
+        "--u-scale-init",
+        type=float,
+        default=DEFAULT_U_SCALE_INIT,
+        help=(
+            "Fixed value, or initialisation of the learned scale. The default "
+            "gives the decoder ~8 logits of travel either side of the base-rate "
+            "bias, enough to express block densities from far below the base "
+            "rate up to ~0.3, while keeping |eta| an order of magnitude short of "
+            "float32 sigmoid saturation"
+        ),
+    )
+    return parser
 
 
 class BestCheckpoint:

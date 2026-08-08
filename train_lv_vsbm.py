@@ -25,6 +25,12 @@ symptom: hard $0/1$ targets place the Bernoulli optimum at $\\eta=\\pm\\infty$,
 whereas a smoothed target caps it at a finite logit (see
 [`training_utils`](training_utils.py)). It is applied to the **training loss
 only** and is inert under the count likelihoods.
+
+``--u-norm unit`` attacks the same divergence from the other side, by bounding
+the *iterate* instead of the optimum: the cluster embeddings are normalised in
+the forward pass and the block logit becomes $\\eta_{kk'} = s\\,\\hat u_k^\\top
+\\hat v_{k'} + b$, so $|\\eta_{kk'} - b| \\le s$ holds identically. ``--u-norm
+none`` (the default) leaves the decoder exactly as it was.
 """
 
 from __future__ import annotations
@@ -61,13 +67,20 @@ from subgraph_sampler import SubgraphBatchSampler
 from training_utils import (
     LABEL_SMOOTHING_TARGETS,
     BestCheckpoint,
+    BlockScale,
+    add_u_norm_arguments,
+    block_scale_metrics,
     checkpoint_metrics,
+    decoder_line,
     label_smoothing_line,
+    make_block_scale,
     prefixed,
     resolve_grad_clip,
     resolve_label_smoothing,
     safe_optimizer_step,
+    scaled_block_embeddings,
     smooth_binary_targets,
+    u_norm_line,
 )
 
 
@@ -168,6 +181,7 @@ def eval_heldout(
     device: str,
     dtype: torch.dtype,
     chunk: int = 8192,
+    scale: BlockScale | None = None,
 ) -> tuple[float, float, float]:
     """Held-out (Bernoulli LL, native LL, AUC) under $\\mathbb{E}_{q_i q_j}$.
 
@@ -178,7 +192,8 @@ def eval_heldout(
     comparable across every run ever made, smoothed or not.
     """
     alpha = torch.softmax(q_logits, dim=-1)
-    eta = u_left @ u_right.T + bias
+    eff_left, eff_right = scaled_block_embeddings(u_left, u_right, scale)
+    eta = eff_left @ eff_right.T + bias
     prob_kk = edge_prob_kk(likelihood, eta, log_r)
     src = held["src"]
     tgt = held["tgt"]
@@ -251,10 +266,13 @@ def train(args: argparse.Namespace) -> dict:
     bias = nn.Parameter(torch.log(torch.tensor([base_rate], dtype=dtype, device=device)))
     q_logits = nn.Parameter((1.0 / args.k) * torch.randn(n, args.k, dtype=dtype, device=device))
     log_r = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
+    scale = make_block_scale(args.u_norm, args.u_scale, args.u_scale_init, args.k, dtype, device)
+    print(u_norm_line(args.u_norm, scale, float(bias.item())))
 
     params = [u_left, u_right, bias, q_logits]
     if args.likelihood == "nb":
         params.append(log_r)
+    params += [] if scale is None else scale.parameters
     optimizer = torch.optim.Adam(params, lr=args.lr)
     grad_clip = resolve_grad_clip(args.grad_clip)
     state = {
@@ -264,6 +282,8 @@ def train(args: argparse.Namespace) -> dict:
         "q_logits": q_logits,
         "log_r": log_r,
     }
+    if scale is not None and scale.log_scale is not None:
+        state["log_scale"] = scale.log_scale
     sampler = SubgraphBatchSampler(
         adj,
         batch_size=args.minibatch,
@@ -313,7 +333,8 @@ def train(args: argparse.Namespace) -> dict:
 
                 idx_t = torch.from_numpy(idx).to(device)
                 q = torch.softmax(q_logits[idx_t], dim=-1)
-                eta = u_left @ u_right.T + bias
+                eff_left, eff_right = scaled_block_embeddings(u_left, u_right, scale)
+                eta = eff_left @ eff_right.T + bias
                 epoch_max_abs_eta = max(epoch_max_abs_eta, float(eta.detach().abs().max().item()))
                 # Training targets only; the held-out labels are never smoothed.
                 target = smooth_binary_targets(
@@ -337,10 +358,21 @@ def train(args: argparse.Namespace) -> dict:
             last_epoch = epoch
             print(sampler.coverage_line(epoch, n_batches, epoch_pos_obs, cum_pos_obs, nnz))
             val_ll, _, val_auc = eval_heldout(
-                q_logits, u_left, u_right, bias, log_r, held, None, args.likelihood, device, dtype
+                q_logits,
+                u_left,
+                u_right,
+                bias,
+                log_r,
+                held,
+                None,
+                args.likelihood,
+                device,
+                dtype,
+                scale=scale,
             )
             checkpoint.update(val_ll, epoch, state)
             n_used = int(torch.unique(torch.argmax(q_logits, dim=-1)).numel())
+            print(decoder_line(epoch, float(bias.item()), scale))
             print(
                 f"loss={mean_loss:.4f} val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
                 f"best_val_ll={checkpoint.metric:.6f}@{checkpoint.epoch} "
@@ -368,6 +400,7 @@ def train(args: argparse.Namespace) -> dict:
                 args.likelihood,
                 device,
                 dtype,
+                scale=scale,
             )
         pred = {mapping[i]: int(assignments[i]) for i in range(len(assignments))}
         return Snapshot(
@@ -383,6 +416,8 @@ def train(args: argparse.Namespace) -> dict:
     # Evaluate the final parameters before restoring, so the cost of any mid-run
     # divergence is measurable rather than inferred.
     last = snapshot()
+    last_scale = block_scale_metrics(scale, "last_")
+    last_bias = float(bias.item())
     restored = checkpoint.epoch != last_epoch and checkpoint.restore(state)
     best = snapshot() if restored else last
 
@@ -418,6 +453,13 @@ def train(args: argparse.Namespace) -> dict:
         "label_smoothing": args.label_smoothing,
         "label_smoothing_target": args.label_smoothing_target,
         "label_smoothing_applied": label_smoothing > 0.0,
+        "u_norm": args.u_norm,
+        "u_scale": args.u_scale,
+        "u_scale_init": args.u_scale_init,
+        **block_scale_metrics(scale),
+        **last_scale,
+        "decoder_bias": float(bias.item()),
+        "last_decoder_bias": last_bias,
         "train_base_rate": base_rate,
         "max_abs_train_logit": max_abs_eta,
         "edges_seen_x_nnz": cum_pos_obs / max(nnz, 1),
@@ -494,6 +536,7 @@ def build_argparser() -> argparse.ArgumentParser:
             "marginal; 'uniform' (0.5) inflates negatives far above the true density"
         ),
     )
+    add_u_norm_arguments(p)
     p.add_argument(
         "--gt",
         default="root_id_type_dict.pkl",
