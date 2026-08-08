@@ -25,7 +25,7 @@ import numpy as np
 from scipy.sparse import load_npz
 
 from evaluate_clustering import evaluate_pair, load_assignment_dict, load_ground_truth
-from heldout import make_heldout_pairs, make_heldout_rows, save_heldout
+from heldout import LIKELIHOODS, make_heldout_pairs, make_heldout_rows, save_heldout
 
 
 @dataclass(frozen=True)
@@ -108,65 +108,36 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
     if "lv" in methods:
         for d in args.lv_dims:
             for lr in args.lv_lrs:
-                name = f"hp_lv_d{d}_lr{lr}"
-                prefix = name
-                specs.append(
-                    RunSpec(
-                        name=name,
-                        method="lv",
-                        prefix=prefix,
-                        hyperparams={"d": d, "lr": lr},
-                        command=[
-                            py,
-                            "train_lv_vsbm.py",
-                            "--k",
-                            str(args.k),
-                            "--d",
-                            str(d),
-                            "--lr",
-                            str(lr),
-                            "--epochs",
-                            str(args.epochs),
-                            "--minibatch",
-                            str(args.minibatch),
-                            "--seed",
-                            str(args.split_seed),
-                            "--device",
-                            args.device,
-                            "--heldout-pairs",
-                            args.heldout_pairs,
-                            "--out-prefix",
-                            prefix,
-                        ],
-                    )
-                )
-
-    if "lv_e" in methods:
-        for d in args.lv_e_dims:
-            for d_e in args.lv_e_d_es:
-                for lr in args.lv_e_lrs:
-                    for e_wd in args.lv_e_wds:
-                        name = f"hp_lv_e_d{d}_de{d_e}_lr{lr}_ewd{e_wd}"
+                for bfs_frac in args.lv_bfs_fracs:
+                    for likelihood in args.lv_likelihoods:
+                        name = f"hp_lv_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}"
                         prefix = name
                         specs.append(
                             RunSpec(
                                 name=name,
-                                method="lv_e",
+                                method="lv",
                                 prefix=prefix,
-                                hyperparams={"d": d, "d_e": d_e, "lr": lr, "e_wd": e_wd},
+                                hyperparams={
+                                    "d": d,
+                                    "lr": lr,
+                                    "bfs_frac": bfs_frac,
+                                    "likelihood": likelihood,
+                                },
                                 command=[
                                     py,
-                                    "train_lv_e.py",
+                                    "train_lv_vsbm.py",
                                     "--k",
                                     str(args.k),
                                     "--d",
                                     str(d),
-                                    "--d-e",
-                                    str(d_e),
-                                    "--e-wd",
-                                    str(e_wd),
                                     "--lr",
                                     str(lr),
+                                    "--bfs-frac",
+                                    str(bfs_frac),
+                                    "--bfs-seeds",
+                                    str(args.bfs_seeds),
+                                    "--likelihood",
+                                    likelihood,
                                     "--epochs",
                                     str(args.epochs),
                                     "--minibatch",
@@ -182,6 +153,121 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                 ],
                             )
                         )
+
+    if "lv" in methods and args.lv_control_updates:
+        # A coverage-defined epoch is longer at higher bfs_frac, so the epoch-matched
+        # grid above also hands the BFS arms more gradient steps. This control gives
+        # uniform sampling the same update budget, separating the two effects.
+        for d in args.lv_dims:
+            for lr in args.lv_lrs:
+                # One likelihood suffices: the control isolates the sampler, not the
+                # observation model, and each control costs as much as a BFS run.
+                for likelihood in args.lv_likelihoods[:1]:
+                    name = f"hp_lv_control_d{d}_lr{lr}_{likelihood}"
+                    specs.append(
+                        RunSpec(
+                            name=name,
+                            method="lv",
+                            prefix=name,
+                            hyperparams={
+                                "d": d,
+                                "lr": lr,
+                                "bfs_frac": 0.0,
+                                "likelihood": likelihood,
+                                "target_updates": args.lv_control_updates,
+                            },
+                            command=[
+                                py,
+                                "train_lv_vsbm.py",
+                                "--k",
+                                str(args.k),
+                                "--d",
+                                str(d),
+                                "--lr",
+                                str(lr),
+                                "--bfs-frac",
+                                "0.0",
+                                "--bfs-seeds",
+                                str(args.bfs_seeds),
+                                "--likelihood",
+                                likelihood,
+                                "--target-updates",
+                                str(args.lv_control_updates),
+                                "--epochs",
+                                str(10**9),
+                                "--minibatch",
+                                str(args.minibatch),
+                                "--seed",
+                                str(args.split_seed),
+                                "--device",
+                                args.device,
+                                "--heldout-pairs",
+                                args.heldout_pairs,
+                                "--out-prefix",
+                                name,
+                            ],
+                        )
+                    )
+
+    if "lv_e" in methods:
+        for d in args.lv_e_dims:
+            for d_e in args.lv_e_d_es:
+                for lr in args.lv_e_lrs:
+                    for e_wd in args.lv_e_wds:
+                        for bfs_frac in args.lv_e_bfs_fracs:
+                            for likelihood in args.lv_e_likelihoods:
+                                name = (
+                                    f"hp_lv_e_d{d}_de{d_e}_lr{lr}_ewd{e_wd}"
+                                    f"_bfs{bfs_frac}_{likelihood}"
+                                )
+                                prefix = name
+                                specs.append(
+                                    RunSpec(
+                                        name=name,
+                                        method="lv_e",
+                                        prefix=prefix,
+                                        hyperparams={
+                                            "d": d,
+                                            "d_e": d_e,
+                                            "lr": lr,
+                                            "e_wd": e_wd,
+                                            "bfs_frac": bfs_frac,
+                                            "likelihood": likelihood,
+                                        },
+                                        command=[
+                                            py,
+                                            "train_lv_e.py",
+                                            "--k",
+                                            str(args.k),
+                                            "--d",
+                                            str(d),
+                                            "--d-e",
+                                            str(d_e),
+                                            "--e-wd",
+                                            str(e_wd),
+                                            "--lr",
+                                            str(lr),
+                                            "--bfs-frac",
+                                            str(bfs_frac),
+                                            "--bfs-seeds",
+                                            str(args.bfs_seeds),
+                                            "--likelihood",
+                                            likelihood,
+                                            "--epochs",
+                                            str(args.epochs),
+                                            "--minibatch",
+                                            str(args.minibatch),
+                                            "--seed",
+                                            str(args.split_seed),
+                                            "--device",
+                                            args.device,
+                                            "--heldout-pairs",
+                                            args.heldout_pairs,
+                                            "--out-prefix",
+                                            prefix,
+                                        ],
+                                    )
+                                )
 
     if "gnn" in methods:
         for layers in args.gnn_layers:
@@ -341,7 +427,9 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     name,
                 ]
             elif method == "lv":
-                name = f"final_lv_d{hp['d']}_lr{hp['lr']}_seed{seed}"
+                control = hp.get("target_updates")
+                tag = "control" if control else f"bfs{hp['bfs_frac']}"
+                name = f"final_lv_d{hp['d']}_lr{hp['lr']}_{tag}_{hp['likelihood']}_seed{seed}"
                 cmd = [
                     py,
                     "train_lv_vsbm.py",
@@ -351,8 +439,12 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     str(hp["d"]),
                     "--lr",
                     str(hp["lr"]),
-                    "--epochs",
-                    str(args.final_epochs),
+                    "--bfs-frac",
+                    str(hp["bfs_frac"]),
+                    "--bfs-seeds",
+                    str(args.bfs_seeds),
+                    "--likelihood",
+                    str(hp["likelihood"]),
                     "--minibatch",
                     str(args.minibatch),
                     "--seed",
@@ -364,9 +456,16 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     "--out-prefix",
                     name,
                 ]
+                if control:
+                    # Scale the control budget with the finals epoch budget.
+                    scaled = int(round(control * args.final_epochs / max(args.epochs, 1)))
+                    cmd += ["--target-updates", str(scaled), "--epochs", str(10**9)]
+                else:
+                    cmd += ["--epochs", str(args.final_epochs)]
             elif method == "lv_e":
                 name = (
-                    f"final_lv_e_d{hp['d']}_de{hp['d_e']}_lr{hp['lr']}_ewd{hp['e_wd']}_seed{seed}"
+                    f"final_lv_e_d{hp['d']}_de{hp['d_e']}_lr{hp['lr']}_ewd{hp['e_wd']}_"
+                    f"bfs{hp['bfs_frac']}_{hp['likelihood']}_seed{seed}"
                 )
                 cmd = [
                     py,
@@ -381,6 +480,12 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     str(hp["e_wd"]),
                     "--lr",
                     str(hp["lr"]),
+                    "--bfs-frac",
+                    str(hp["bfs_frac"]),
+                    "--bfs-seeds",
+                    str(args.bfs_seeds),
+                    "--likelihood",
+                    str(hp["likelihood"]),
                     "--epochs",
                     str(args.final_epochs),
                     "--minibatch",
@@ -532,12 +637,32 @@ def main() -> None:
     p.add_argument("--row-holdout", type=float, default=0.1)
     p.add_argument("--pca-dims", type=int, nargs="+", default=[32, 64])
     p.add_argument("--pca-lrs", type=float, nargs="+", default=[0.01])
-    p.add_argument("--lv-dims", type=int, nargs="+", default=[32, 64])
-    p.add_argument("--lv-lrs", type=float, nargs="+", default=[0.05, 0.1])
-    p.add_argument("--lv-e-dims", type=int, nargs="+", default=[32, 64])
-    p.add_argument("--lv-e-d-es", type=int, nargs="+", default=[16, 32])
-    p.add_argument("--lv-e-lrs", type=float, nargs="+", default=[0.05, 0.1])
-    p.add_argument("--lv-e-wds", type=float, nargs="+", default=[1e-3, 1e-2])
+    p.add_argument("--lv-dims", type=int, nargs="+", default=[64])
+    p.add_argument("--lv-lrs", type=float, nargs="+", default=[0.1])
+    p.add_argument("--lv-bfs-fracs", type=float, nargs="+", default=[0.0, 0.5, 1.0])
+    p.add_argument(
+        "--lv-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson", "nb"]
+    )
+    p.add_argument("--lv-e-dims", type=int, nargs="+", default=[64])
+    p.add_argument("--lv-e-d-es", type=int, nargs="+", default=[16])
+    p.add_argument("--lv-e-lrs", type=float, nargs="+", default=[0.05])
+    p.add_argument("--lv-e-wds", type=float, nargs="+", default=[1e-2])
+    p.add_argument("--lv-e-bfs-fracs", type=float, nargs="+", default=[0.5])
+    p.add_argument(
+        "--lv-e-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson"]
+    )
+    p.add_argument(
+        "--bfs-seeds", type=int, default=4, help="BFS seeds per expansion round (LV / LV+e)"
+    )
+    p.add_argument(
+        "--lv-control-updates",
+        type=int,
+        default=0,
+        help=(
+            "If set, add LV runs at bfs_frac=0 with this total update budget, "
+            "matching the compute of the BFS arms (0 disables the control)"
+        ),
+    )
     p.add_argument("--gnn-layers", type=int, nargs="+", default=[0, 1, 2, 4])
     p.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
     p.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
@@ -582,6 +707,8 @@ def main() -> None:
                 **spec.hyperparams,
                 "val_metric": metrics["val_metric"],
                 "val_metric_name": metrics["val_metric_name"],
+                "val_native_ll": metrics.get("val_native_ll"),
+                "val_native_ll_name": metrics.get("val_native_ll_name"),
                 "n_pred_clusters": metrics.get("n_pred_clusters"),
             }
             # Optional GT score for analysis only — NOT used for selection.
@@ -602,6 +729,9 @@ def main() -> None:
             hp = {"d": int(best["d"]), "lr": float(best["lr"])}
             if method == "gnn":
                 hp["layers"] = int(best["layers"])
+            if method in {"lv", "lv_e"}:
+                hp["bfs_frac"] = float(best["bfs_frac"])
+                hp["likelihood"] = str(best["likelihood"])
             if method == "lv_e":
                 hp["d_e"] = int(best["d_e"])
                 hp["e_wd"] = float(best["e_wd"])
@@ -651,6 +781,8 @@ def main() -> None:
                 "method": spec.method,
                 **spec.hyperparams,
                 "val_metric": metrics["val_metric"],
+                "val_native_ll": metrics.get("val_native_ll"),
+                "val_native_ll_name": metrics.get("val_native_ll_name"),
                 **{f"gt_{k}": v for k, v in gt_metrics.items()},
             }
             final_rows.append(row)

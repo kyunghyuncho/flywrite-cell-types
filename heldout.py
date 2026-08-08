@@ -8,6 +8,14 @@ We never use ground-truth neuron types for hyperparameter selection. Instead:
 * **PCA:** hold out a fixed set of node rows and score by mean squared
   reconstruction error on those rows (lower is better; we store the negated
   value so that higher ``val_metric`` is always better across methods).
+
+Count likelihoods (Poisson / negative binomial) produce log-likelihoods on a
+scale that is not comparable with the Bernoulli one, so the selection metric
+remains the held-out **Bernoulli** log-likelihood for every variant. The helpers
+below convert a fitted count model into the implied probability of a present
+edge, $P(y>0)=1-e^{-\\lambda}$ for Poisson and $P(y>0)=1-(r/(r+\\mu))^{r}$ for
+the negative binomial, so that the binary held-out labels can be scored
+directly. The native count log-likelihood is reported separately.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.sparse import csr_matrix
+from scipy.stats import rankdata
 
 
 def make_heldout_pairs(
@@ -130,6 +139,87 @@ def heldout_pair_mask(
 def mean_bernoulli_ll(logits: torch.Tensor, y: torch.Tensor) -> float:
     """Mean Bernoulli log-likelihood (higher is better)."""
     return float((-F.binary_cross_entropy_with_logits(logits, y, reduction="mean")).item())
+
+
+LIKELIHOODS = ("bernoulli", "poisson", "nb")
+ETA_MIN = -30.0
+ETA_MAX = 10.0
+
+
+def native_ll_name(likelihood: str) -> str:
+    """Metrics-file name for the native held-out log-likelihood of a likelihood."""
+    return f"heldout_{likelihood}_ll"
+
+
+def clamp_eta(eta: torch.Tensor) -> torch.Tensor:
+    """Keep log-rates in a range where ``exp`` cannot overflow float32."""
+    return torch.clamp(eta, min=ETA_MIN, max=ETA_MAX)
+
+
+def lookup_pair_counts(adj: csr_matrix, src: np.ndarray, tgt: np.ndarray) -> np.ndarray:
+    """Synapse counts of the given directed pairs from the *unbinarized* adjacency.
+
+    Held-out pairs are masked out of the training objective, so reading their
+    weights back is a label lookup rather than leakage.
+    """
+    return np.asarray(adj[src, tgt]).ravel().astype(np.float32)
+
+
+def poisson_log_pmf(y: torch.Tensor, eta: torch.Tensor) -> torch.Tensor:
+    """$\\log p(y\\mid\\lambda=e^{\\eta})$ for the Poisson."""
+    eta = clamp_eta(eta)
+    return y * eta - torch.exp(eta) - torch.lgamma(y + 1.0)
+
+
+def nb_log_pmf(y: torch.Tensor, eta: torch.Tensor, log_r: torch.Tensor) -> torch.Tensor:
+    """$\\log p(y\\mid\\mu=e^{\\eta}, r=e^{\\log r})$ for the negative binomial."""
+    eta = clamp_eta(eta)
+    r = torch.exp(log_r)
+    log_denom = torch.logaddexp(log_r, eta)
+    return (
+        torch.lgamma(y + r)
+        - torch.lgamma(r)
+        - torch.lgamma(y + 1.0)
+        + r * (log_r - log_denom)
+        + y * (eta - log_denom)
+    )
+
+
+def poisson_edge_logit(eta: torch.Tensor) -> torch.Tensor:
+    """Logit of $P(y>0)=1-e^{-\\lambda}$ implied by a Poisson log-rate."""
+    lam = torch.exp(clamp_eta(eta))
+    log_p = torch.log(torch.clamp(-torch.expm1(-lam), min=1e-12))
+    return log_p + lam
+
+
+def nb_edge_logit(eta: torch.Tensor, log_r: torch.Tensor) -> torch.Tensor:
+    """Logit of $P(y>0)=1-(r/(r+\\mu))^{r}$ implied by a negative binomial."""
+    eta = clamp_eta(eta)
+    r = torch.exp(log_r)
+    log_q0 = torch.clamp(r * (log_r - torch.logaddexp(log_r, eta)), max=-1e-7)
+    log_p = torch.log(torch.clamp(-torch.expm1(log_q0), min=1e-12))
+    return log_p - log_q0
+
+
+@torch.no_grad()
+def mean_auc(scores: torch.Tensor, y: torch.Tensor) -> float:
+    """ROC AUC of ``scores`` against binary ``y`` via the Mann-Whitney statistic.
+
+    Unlike the Bernoulli log-likelihood this is invariant to any monotone
+    recalibration, so it separates genuine ranking of edges above non-edges from
+    a base rate inflated by training on dense subgraph blocks.
+    """
+    s = scores.flatten().detach().cpu().numpy().astype(np.float64)
+    pos = y.flatten().detach().cpu().numpy() > 0.5
+    n_pos = int(pos.sum())
+    n_neg = int(pos.size - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    # Midranks matter: an untrained model predicts a near-constant score, and the
+    # held-out file lists every positive before every negative, so breaking ties
+    # by index would report AUC near 0 instead of 0.5.
+    ranks = rankdata(s, method="average")
+    return (ranks[pos].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
 
 def write_metrics(path: Path | str, metrics: dict) -> None:

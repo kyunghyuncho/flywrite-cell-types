@@ -7,6 +7,12 @@ Edge logits:
 ``e_i`` captures within-type / degree-like residual connectivity. Weight decay
 is applied **only** to ``e`` (Adam param group) so residuals stay small and do
 not absorb cluster identity. Clusters are still read from ``argmax(alpha)``.
+
+Minibatches are square induced subgraphs from
+[`subgraph_sampler.SubgraphBatchSampler`](subgraph_sampler.py). Unlike the
+aggregated LV objective this trainer scores pairs directly, so ``--likelihood
+{poisson,nb}`` simply reinterprets ``logit_ij`` as a log-rate over unbinarized
+synapse counts. Selection stays on the held-out Bernoulli log-likelihood.
 """
 
 from __future__ import annotations
@@ -18,17 +24,26 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy.sparse import load_npz
+from scipy.sparse import csr_matrix, load_npz
 from torch import nn
 from tqdm import tqdm
 
 from heldout import (
+    LIKELIHOODS,
     heldout_pair_mask,
     load_heldout,
+    lookup_pair_counts,
+    mean_auc,
     mean_bernoulli_ll,
+    native_ll_name,
+    nb_edge_logit,
+    nb_log_pmf,
+    poisson_edge_logit,
+    poisson_log_pmf,
     write_metrics,
 )
 from index_mapping import load_mapping
+from subgraph_sampler import SubgraphBatchSampler
 
 
 def pick_device(requested: str | None) -> str:
@@ -45,23 +60,62 @@ def log_clamp(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return torch.log(torch.clamp(x, min=eps))
 
 
+def load_adjacency(path: str, likelihood: str) -> tuple[csr_matrix, csr_matrix]:
+    """Return ``(counts, training adjacency)``; the latter is binary only for Bernoulli."""
+    counts = load_npz(path).tocsr().astype(np.float32)
+    counts.eliminate_zeros()
+    if likelihood != "bernoulli":
+        return counts, counts
+    binary = counts.copy()
+    binary.data = (binary.data > 0).astype(np.float32)
+    binary.eliminate_zeros()
+    return counts, binary
+
+
+def pair_log_lik(
+    likelihood: str, logits: torch.Tensor, target: torch.Tensor, log_r: torch.Tensor
+) -> torch.Tensor:
+    """Per-pair log-likelihood; ``logits`` is a logit (Bernoulli) or a log-rate."""
+    if likelihood == "bernoulli":
+        return -F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    if likelihood == "poisson":
+        return poisson_log_pmf(target, logits)
+    return nb_log_pmf(target, logits, log_r)
+
+
+def pair_edge_logit(likelihood: str, logits: torch.Tensor, log_r: torch.Tensor) -> torch.Tensor:
+    """Logit of $P(y>0)$ implied by the fitted likelihood."""
+    if likelihood == "bernoulli":
+        return logits
+    if likelihood == "poisson":
+        return poisson_edge_logit(logits)
+    return nb_edge_logit(logits, log_r)
+
+
 @torch.no_grad()
-def eval_heldout_ll(
+def eval_heldout(
     q_logits: torch.Tensor,
     u_left: torch.Tensor,
     u_right: torch.Tensor,
     bias: torch.Tensor,
     e: torch.Tensor,
+    log_r: torch.Tensor,
     held: dict[str, np.ndarray],
+    counts: np.ndarray | None,
+    likelihood: str,
     device: str,
     dtype: torch.dtype,
     chunk: int = 8192,
-) -> float:
+) -> tuple[float, float, float]:
+    """Held-out (Bernoulli LL, native LL, AUC) for the fitted model."""
     alpha = torch.softmax(q_logits, dim=-1)
     src = held["src"]
     tgt = held["tgt"]
     y = torch.tensor(held["y"], dtype=dtype, device=device)
+    y_count = None if counts is None else torch.tensor(counts, dtype=dtype, device=device)
     lls = []
+    native = []
+    edge_logits = []
     for start in range(0, len(src), chunk):
         sl = slice(start, start + chunk)
         ai = alpha[src[sl]]
@@ -69,8 +123,14 @@ def eval_heldout_ll(
         lv = ((ai @ u_left) * (aj @ u_right)).sum(dim=-1)
         resid = (e[src[sl]] * e[tgt[sl]]).sum(dim=-1)
         logits = lv + bias + resid
-        lls.append(mean_bernoulli_ll(logits, y[sl]))
-    return float(np.mean(lls))
+        edge_logit = pair_edge_logit(likelihood, logits, log_r)
+        lls.append(mean_bernoulli_ll(edge_logit, y[sl]))
+        edge_logits.append(edge_logit)
+        if y_count is not None:
+            native.append(float(pair_log_lik(likelihood, logits, y_count[sl], log_r).mean().item()))
+    bern_ll = float(np.mean(lls))
+    auc = mean_auc(torch.cat(edge_logits), y)
+    return bern_ll, float(np.mean(native)) if native else bern_ll, auc
 
 
 def train(args: argparse.Namespace) -> dict:
@@ -78,16 +138,23 @@ def train(args: argparse.Namespace) -> dict:
     dtype = torch.float32
     torch.manual_seed(args.seed)
 
-    adj = load_npz(args.adjacency)
-    adj.data = (adj.data > 0).astype(np.float32)
-    adj.eliminate_zeros()
+    adj_counts, adj = load_adjacency(args.adjacency, args.likelihood)
     n = adj.shape[0]
-    print(f"Loaded A with shape {adj.shape}, nnz={adj.nnz}, device={device}")
-    print(f"LV+e: d={args.d} d_e={args.d_e} e_wd={args.e_wd} lr={args.lr}")
+    nnz = int(adj.nnz)
+    print(f"Loaded A with shape {adj.shape}, nnz={nnz}, device={device}")
+    print(
+        f"LV+e: d={args.d} d_e={args.d_e} e_wd={args.e_wd} lr={args.lr} "
+        f"likelihood={args.likelihood} bfs_frac={args.bfs_frac} bfs_seeds={args.bfs_seeds}"
+    )
 
     held = load_heldout(Path(args.heldout_pairs))
     held_src_np = held["src"]
     held_tgt_np = held["tgt"]
+    held_counts = (
+        None
+        if args.likelihood == "bernoulli"
+        else lookup_pair_counts(adj_counts, held_src_np, held_tgt_np)
+    )
 
     u_left = nn.Parameter(
         (1.0 / np.sqrt(args.k * args.d)) * torch.randn(args.k, args.d, dtype=dtype, device=device)
@@ -103,82 +170,102 @@ def train(args: argparse.Namespace) -> dict:
     e = nn.Parameter(
         (0.01 / np.sqrt(args.d_e)) * torch.randn(n, args.d_e, dtype=dtype, device=device)
     )
+    log_r = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
 
+    dense_params = [u_left, u_right, bias, q_logits]
+    if args.likelihood == "nb":
+        dense_params.append(log_r)
     optimizer = torch.optim.Adam(
         [
-            {"params": [u_left, u_right, bias, q_logits], "weight_decay": 0.0},
+            {"params": dense_params, "weight_decay": 0.0},
             {"params": [e], "weight_decay": args.e_wd},
         ],
         lr=args.lr,
     )
-    n_minibatches = max(n // args.minibatch, 1)
+    clip_params = [*dense_params, e]
+    sampler = SubgraphBatchSampler(
+        adj,
+        batch_size=args.minibatch,
+        bfs_frac=args.bfs_frac,
+        n_seeds=args.bfs_seeds,
+        seed=args.seed,
+    )
     best_val = -float("inf")
+    cum_pos_obs = 0
+    total_updates = 0
+    # A coverage-defined epoch is longer at higher bfs_frac, so an update budget is
+    # what makes compute comparable across bfs_frac.
+    epochs = args.epochs if args.target_updates is None else 10**9
 
     try:
-        for epoch in range(args.epochs):
-            print(f"Epoch {epoch}")
-            indices_i = torch.randperm(n, device=device)
-            indices_j = torch.randperm(n, device=device)
-            final_loss = 0.0
+        for epoch in range(epochs):
+            if args.target_updates is not None and total_updates >= args.target_updates:
+                break
+            loss_sum = 0.0
+            n_batches = 0
+            epoch_pos_obs = 0
 
-            for step in tqdm(range(n_minibatches), desc=f"lv_e epoch {epoch}"):
-                if args.max_updates is not None and step >= args.max_updates:
+            for idx in tqdm(sampler.epoch(), desc=f"lv_e epoch {epoch}"):
+                if args.max_updates is not None and n_batches >= args.max_updates:
                     break
-                idx_i = indices_i[step * args.minibatch : (step + 1) * args.minibatch]
-                idx_j = indices_j[step * args.minibatch : (step + 1) * args.minibatch]
-                if idx_i.numel() == 0 or idx_j.numel() == 0:
-                    continue
-
-                q_i = torch.softmax(q_logits[idx_i], dim=-1)
-                q_j = torch.softmax(q_logits[idx_j], dim=-1)
-                cc = torch.tensor(
-                    adj[idx_i.cpu().numpy()][:, idx_j.cpu().numpy()].toarray(),
-                    dtype=dtype,
-                    device=device,
-                )
+                if args.target_updates is not None and total_updates >= args.target_updates:
+                    break
+                block = torch.tensor(adj[idx][:, idx].toarray(), dtype=dtype, device=device)
                 mask = torch.tensor(
-                    heldout_pair_mask(
-                        idx_i.cpu().numpy(),
-                        idx_j.cpu().numpy(),
-                        held_src_np,
-                        held_tgt_np,
-                    ),
-                    device=device,
+                    heldout_pair_mask(idx, idx, held_src_np, held_tgt_np), device=device
                 )
-                keep = (~mask).to(dtype)
-                if not bool((keep > 0).any()):
+                keep = ~mask
+                # The graph has no self-loops; do not train on the diagonal.
+                keep.fill_diagonal_(False)
+                keep = keep.to(dtype)
+                n_keep = keep.sum()
+                if float(n_keep.item()) == 0.0:
                     continue
+                n_batches += 1
+                total_updates += 1
+                epoch_pos_obs += int(((block > 0).to(dtype) * keep).sum().item())
 
-                lv = (q_i @ u_left) @ (q_j @ u_right).T
-                resid = e[idx_i] @ e[idx_j].T
+                idx_t = torch.from_numpy(idx).to(device)
+                q = torch.softmax(q_logits[idx_t], dim=-1)
+                lv = (q @ u_left) @ (q @ u_right).T
+                resid = e[idx_t] @ e[idx_t].T
                 logits = lv + bias + resid
 
-                bce = (
-                    F.binary_cross_entropy_with_logits(logits, cc, reduction="none") * keep
-                ).sum() / keep.sum().clamp(min=1.0)
-                # Scale like other trainers; entropy on soft assignments.
-                ll = -bce * float(idx_i.numel() * idx_j.numel())
-                entropy = -(q_i * log_clamp(q_i)).sum(1).mean() / 2.0
-                entropy = entropy - (q_j * log_clamp(q_j)).sum(1).mean() / 2.0
+                pair_ll = pair_log_lik(args.likelihood, logits, block, log_r)
+                ll = ((pair_ll * keep).sum() / n_keep.clamp(min=1.0)) * float(idx.size * idx.size)
+                entropy = -(q * log_clamp(q)).sum(1).mean()
                 loss = -(ll + entropy)
 
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_([u_left, u_right, bias, q_logits, e], 1.0)
+                torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
                 optimizer.step()
-                final_loss = float(loss.item())
+                loss_sum += float(loss.item())
 
-            val_ll = eval_heldout_ll(
-                q_logits, u_left, u_right, bias, e, held, device, dtype
+            mean_loss = loss_sum / max(n_batches, 1)
+            cum_pos_obs += epoch_pos_obs
+            print(sampler.coverage_line(epoch, n_batches, epoch_pos_obs, cum_pos_obs, nnz))
+            val_ll, _, val_auc = eval_heldout(
+                q_logits,
+                u_left,
+                u_right,
+                bias,
+                e,
+                log_r,
+                held,
+                None,
+                args.likelihood,
+                device,
+                dtype,
             )
             best_val = max(best_val, val_ll)
             with torch.no_grad():
                 n_used = int(torch.unique(torch.argmax(q_logits, dim=-1)).numel())
                 e_rms = float(torch.sqrt(torch.mean(e * e)).item())
             print(
-                f"loss={final_loss:.4f} val_ll={val_ll:.6f} "
+                f"loss={mean_loss:.4f} val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
                 f"best_val_ll={best_val:.6f} clusters={n_used}/{args.k} "
-                f"e_rms={e_rms:.5f}"
+                f"e_rms={e_rms:.5f} updates={total_updates}"
             )
     except KeyboardInterrupt:
         print("Training interrupted.")
@@ -186,13 +273,23 @@ def train(args: argparse.Namespace) -> dict:
     with torch.no_grad():
         assignments = torch.argmax(q_logits, dim=-1).cpu().numpy()
         scores = torch.max(torch.softmax(q_logits, dim=-1), dim=-1).values.cpu().numpy()
-        val_ll = eval_heldout_ll(q_logits, u_left, u_right, bias, e, held, device, dtype)
+        val_ll, native_ll, val_auc = eval_heldout(
+            q_logits,
+            u_left,
+            u_right,
+            bias,
+            e,
+            log_r,
+            held,
+            held_counts,
+            args.likelihood,
+            device,
+            dtype,
+        )
         e_rms = float(torch.sqrt(torch.mean(e * e)).item())
 
     mapping = load_mapping(args.mapping)
-    cluster_assignment_dict = {
-        mapping[i]: int(assignments[i]) for i in range(len(assignments))
-    }
+    cluster_assignment_dict = {mapping[i]: int(assignments[i]) for i in range(len(assignments))}
     prefix = Path(args.out_prefix)
     np.save(f"{prefix}_assignments.npy", assignments)
     np.save(f"{prefix}_scores.npy", scores)
@@ -203,6 +300,9 @@ def train(args: argparse.Namespace) -> dict:
         "val_metric": val_ll,
         "val_metric_name": "heldout_bernoulli_ll",
         "val_metric_higher_is_better": True,
+        "val_native_ll": native_ll,
+        "val_native_ll_name": native_ll_name(args.likelihood),
+        "val_auc": val_auc,
         "seed": args.seed,
         "k": args.k,
         "d": args.d,
@@ -211,10 +311,20 @@ def train(args: argparse.Namespace) -> dict:
         "e_rms": e_rms,
         "lr": args.lr,
         "epochs": args.epochs,
+        "likelihood": args.likelihood,
+        "bfs_frac": args.bfs_frac,
+        "bfs_seeds": args.bfs_seeds,
+        "edges_seen_x_nnz": cum_pos_obs / max(nnz, 1),
+        "total_updates": total_updates,
+        "target_updates": args.target_updates,
+        "nb_r": float(torch.exp(log_r).item()) if args.likelihood == "nb" else None,
         "n_pred_clusters": int(len(np.unique(assignments))),
     }
     write_metrics(f"{prefix}_metrics.json", metrics)
-    print(f"Saved {prefix}_* ; val_ll={val_ll:.6f} e_rms={e_rms:.5f}")
+    print(
+        f"Saved {prefix}_* ; val_ll={val_ll:.6f} native_ll={native_ll:.6f} "
+        f"val_auc={val_auc:.4f} e_rms={e_rms:.5f}"
+    )
     return metrics
 
 
@@ -229,9 +339,28 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--d-e", type=int, default=16, help="Node residual dim")
     p.add_argument("--e-wd", type=float, default=1e-2, help="Weight decay on e only")
     p.add_argument("--minibatch", type=int, default=2048)
-    p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--max-updates", type=int, default=None)
+    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--max-updates", type=int, default=None, help="Cap on updates per epoch")
+    p.add_argument(
+        "--target-updates",
+        type=int,
+        default=None,
+        help="Total update budget, overriding --epochs; matches compute across bfs_frac",
+    )
     p.add_argument("--lr", type=float, default=1e-1)
+    p.add_argument(
+        "--bfs-frac",
+        type=float,
+        default=0.5,
+        help="Fraction of each minibatch grown by BFS; 0 recovers uniform sampling",
+    )
+    p.add_argument("--bfs-seeds", type=int, default=4, help="BFS seeds per expansion round")
+    p.add_argument(
+        "--likelihood",
+        choices=LIKELIHOODS,
+        default="bernoulli",
+        help="Edge likelihood; count models use unbinarized synapse counts",
+    )
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", default=None)
     return p

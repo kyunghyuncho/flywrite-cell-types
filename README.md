@@ -41,6 +41,111 @@ $$
 Parameters $\{\beta,U_s,U_t,b\}$ are trained by minibatch maximization of the variational
 lower bound (Bernoulli likelihood under $q$ plus entropy of $\alpha$).
 
+### Subgraph minibatches and count likelihoods (LV and LV+$e$)
+
+Both LV trainers ([`train_lv_vsbm.py`](train_lv_vsbm.py),
+[`train_lv_e.py`](train_lv_e.py)) share the sampler in
+[`subgraph_sampler.py`](subgraph_sampler.py) and support weighted edge
+likelihoods. The GNN variants are unchanged.
+
+**Why.** The original minibatch drew two *independent* node permutations $I$ and
+$J$ and scored the rectangular block $A[I,J]$. At density $1.5\times10^{-4}$ a
+$2048\times2048$ block contains only $\approx 625$ of the $2.7\times10^{6}$
+edges, so a $20$-epoch run observed roughly $0.3\times$ the edge set — the model
+essentially never saw the graph, only its sparsity.
+
+**Square induced subgraphs.** A single node set $S$ now indexes both rows and
+columns, and $S$ is grown by breadth-first expansion over the undirected pattern
+$A+A^{\top}$ (CSR `indptr`/`indices`, vectorized frontier gathers; sampling costs
+$\ll1$ s per epoch). Reciprocal edges and within-neighbourhood structure are
+therefore present in the block. The graph has no self-loops, so the diagonal is
+masked out of the loss exactly like the held-out pairs.
+
+**Mixing (`--bfs-frac`).** A pure BFS block is roughly two orders of magnitude
+denser than the graph, which inflates the learned base rate $b$ and destroys
+calibration against the held-out pairs. Each batch therefore mixes a
+`--bfs-frac` fraction of BFS-grown nodes with a uniformly sampled remainder:
+$0$ recovers the previous uniform sampling, $1$ gives a pure neighbourhood
+subgraph, default $0.5$. This is the primary quantity to sweep.
+
+Note that the held-out Bernoulli log-likelihood does **not** arbitrate this on its
+own. The held-out set is balanced ($50$k positives, $50$k negatives) while the
+graph is $1.5\times10^{-4}$ dense, so a model whose base rate has been inflated by
+training on dense blocks scores *better* there regardless of what it learned. The
+trainers therefore also report `val_auc`, the held-out ROC AUC, which is invariant
+to any monotone recalibration and so measures ranking of edges above non-edges
+directly. The two can disagree sharply: at `bfs_frac=0.5` over three epochs the
+log-likelihood degraded monotonically ($-2.80\to-3.08$) while AUC improved
+($0.68\to0.79$), so early stopping on log-likelihood would have selected the worst
+of the three models.
+
+**Coverage.** An epoch is one full pass over the node set: BFS seeds and the
+uniform component are both drawn from a pool of nodes not yet visited in that
+epoch, BFS prefers unvisited candidates and re-anchors on a fresh seed when an
+expansion mostly recycles seen nodes, and the epoch ends when the pool empties.
+Each epoch prints a greppable diagnostic,
+
+```
+[coverage] epoch=0 batches=90 bfs_frac=0.5 visits_min=1 visits_median=1.0 \
+  visits_mean=1.36 visits_max=60 uncovered=0 pos_edge_obs=524964 \
+  cum_pos_edge_obs=524964 edges_seen_x_nnz=0.19
+```
+
+Measured at $|S|=2048$ on the FlyWire graph (one epoch, full coverage in every
+case):
+
+| `bfs_frac` | batches/epoch | edges per block | edge observations / epoch | $\times$ nnz |
+|---|---|---|---|---|
+| 0.0 | 66 | 625 | 41 208 | 0.02 |
+| 0.25 | 74 | 3 289 | 243 357 | 0.09 |
+| 0.5 | 90 | 5 835 | 524 964 | 0.19 |
+| 1.0 | 226 | 11 318 | 2 557 158 | 0.95 |
+
+Because an epoch is defined by coverage rather than by a fixed batch count, its
+cost grows with `bfs_frac` ($66$ batches at $0$ versus $226$ at $1$), so the
+epoch-matched grid also hands the BFS arms $3.4\times$ more gradient updates. To
+separate the sampler from the extra compute, `--target-updates` sets a total
+update budget that overrides `--epochs`, and `run_experiments.py
+--lv-control-updates N` adds a matched-compute control at `bfs_frac=0`. Trainer
+defaults were raised to
+`--epochs 40` so the edge set is traversed several times;
+[`run_experiments.py`](run_experiments.py) still overrides with `--epochs` /
+`--final-epochs`.
+
+**Count likelihoods (`--likelihood {bernoulli,poisson,nb}`).** Synapse counts run
+from $1$ to $18$ (mean $1.43$; $73\%$ equal to $1$) and binarization discards
+them. For `poisson` and `nb` the adjacency is *not* binarized and the existing
+linear predictor $\eta$ is read as a log-rate,
+
+$$
+\log p_{\mathrm{Poi}}(y)=y\eta-e^{\eta}-\log y!,
+\qquad
+\log p_{\mathrm{NB}}(y)=\log\frac{\Gamma(y+r)}{\Gamma(r)\,y!}
++r\log\frac{r}{r+\mu}+y\log\frac{\mu}{r+\mu},
+$$
+
+with $\mu=e^{\eta}$ and a learnable scalar dispersion parameterized as $\log r$;
+$\eta$ is clamped to $[-30,10]$. `train_lv_vsbm.py` never forms per-pair logits,
+so the count terms are folded into its exact $K\times K$ aggregation: with
+$w^{\mathrm{count}}=q^{\top}(C\odot M)q$ and $w^{\mathrm{all}}=q^{\top}Mq$ for
+keep-mask $M$, the Poisson objective is
+$\sum_{kk'}[w^{\mathrm{count}}_{kk'}\eta_{kk'}-w^{\mathrm{all}}_{kk'}e^{\eta_{kk'}}]$,
+and for the negative binomial the two $\log(r/(r+\mu))$ and $\log(\mu/(r+\mu))$
+terms aggregate the same way while $\log\Gamma(y+r)-\log\Gamma(r)$ is evaluated
+directly on the block. `train_lv_e.py` scores pairs directly and simply swaps its
+per-pair term. Terms constant in the parameters ($-\log y!$) are dropped from the
+training objective and retained in the held-out report.
+
+**Selection stays Bernoulli.** Log-likelihoods of different families are not
+comparable, so `val_metric` remains the held-out mean Bernoulli log-likelihood
+(`val_metric_name = heldout_bernoulli_ll`) for every variant, comparable with all
+earlier `lv` / `lv_e` results. For count models the implied edge probability
+$P(y>0)=1-e^{-\lambda}$ (Poisson) or $1-(r/(r+\mu))^{r}$ (NB) is converted to a
+logit and scored against the binary held-out labels. The native count
+log-likelihood is reported separately as `val_native_ll` / `val_native_ll_name`;
+held-out counts are read from the unbinarized adjacency, which is a label lookup
+rather than leakage because those pairs are masked out of training.
+
 ### Low-rank vSBM + node residuals $e_i$ (no GNN)
 
 Implemented in [`train_lv_e.py`](train_lv_e.py). Same LV bilinear backbone, plus a
@@ -60,6 +165,7 @@ Smoke:
 
 ```bash
 uv run python train_lv_e.py --epochs 1 --max-updates 5 --minibatch 1024 --seed 0
+uv run python train_lv_e.py --epochs 1 --max-updates 5 --bfs-frac 1.0 --likelihood nb --seed 0
 ```
 
 ### GNN$_e$-vSBM (multi-hop residual over $e_i$)
@@ -152,6 +258,9 @@ held-out unsupervised metrics only ([`heldout.py`](heldout.py)):
 2. **Phase 1 — HP search:** each method sweeps its own grid; pick the setting that
    maximizes held-out Bernoulli log-likelihood (LV / LV+$e$ / GNN / GNN$_e$) or
    minimizes held-out row MSE (PCA; stored as negated MSE so higher is always better).
+   Count-likelihood LV variants are also selected on the held-out **Bernoulli**
+   log-likelihood implied by the fitted count model, so `val_metric` stays on one
+   scale; their native log-likelihood is recorded as `val_native_ll`.
 3. **Phase 2 — multi-seed finals:** retrain the selected setting with several seeds
    (default `0,1,2`). Report Hungarian / ARI / NMI vs visual types as mean ± std.
 
@@ -159,8 +268,18 @@ Orchestration: [`run_experiments.py`](run_experiments.py). Outputs:
 `hp_results.*`, `hp_best.json`, `final_results.*`, `final_summary.*`.
 Select methods with `--methods` (e.g. `lv lv_e ntac`).
 
-Lean LV+$e$ HP grid: $d\in\{32,64\}$, $d_e\in\{16,32\}$, $\mathrm{lr}\in\{0.05,0.1\}$,
-$e_{\mathrm{wd}}\in\{10^{-3},10^{-2}\}$. Lean GNN$_e$ grid: $L\in\{0,1,2\}$,
+Current LV grids fix the architecture at the previously selected optimum and
+spend the budget on the sampler and the likelihood instead:
+
+* **LV** (`--lv-dims 64 --lv-lrs 0.1`): `--lv-bfs-fracs 0.0 0.5 1.0` $\times$
+  `--lv-likelihoods bernoulli poisson nb` — $9$ runs. The `bfs_frac`$=0$ /
+  `bernoulli` cell is the control that reproduces the previous configuration.
+* **LV+$e$** (`--lv-e-dims 64 --lv-e-d-es 16 --lv-e-lrs 0.05 --lv-e-wds 0.01`):
+  `--lv-e-bfs-fracs 0.5` $\times$ `--lv-e-likelihoods bernoulli poisson` — $2$
+  runs; the `bfs_frac` ablation is carried by the LV arm.
+
+That is $11$ HP runs plus $3\times2=6$ multi-seed finals. `--bfs-seeds`
+(default $4$) is shared and not swept. Lean GNN$_e$ grid: $L\in\{0,1,2\}$,
 $d\in\{32,64\}$, $d_e{=}16$, $\mathrm{lr}\in\{0.005,0.01\}$, $e_{\mathrm{wd}}{=}10^{-2}$.
 NTAC defaults: $K{=}729$, $R{=}12$, $T{=}0.1$ (paper). Optional α-GNN grid:
 $L\in\{0,1,2,4\}$, $d\in\{32,64\}$, $\mathrm{lr}\in\{0.005,0.01\}$.
@@ -201,7 +320,28 @@ uv run jupyter notebook inspect_sweep_results.ipynb
 ```
 
 The notebook expects `hp_results.csv`, `hp_best.json`, `final_results.csv`, and
-`final_summary.csv` in the working directory.
+`final_summary.csv` in the working directory. Selection metrics are method-specific
+(held-out Bernoulli LL, negated row MSE, negated mean Jaccard cost), so `val_metric`
+is only ever plotted on per-method axes; only Hungarian / ARI / NMI are comparable
+across methods.
+
+#### Recovering an interrupted sweep
+
+If a remote sweep is cut short after the HP phase, the finals rows can be
+reconstructed offline from the saved assignment dictionaries — the ground-truth
+metrics are a cheap CPU computation and do not require retraining. For the
+NTAC-only sweep (whose artifacts were retrieved with an `ntac_` prefix):
+
+```bash
+uv run python merge_ntac_results.py --dry-run   # inspect the planned merge
+uv run python merge_ntac_results.py             # write, backing up to *.prentac.bak
+```
+
+The script recomputes Hungarian / ARI / NMI with `evaluate_clustering.evaluate_pair`,
+takes the unsupervised `val_metric` from the surviving remote log, and merges the
+rows into `hp_results.*`, `hp_best.json`, `final_results.*`, and `final_summary.*`
+using the same sorted key-union schema as `run_experiments.py`. It is idempotent:
+existing `ntac` rows are replaced rather than duplicated.
 
 Single-model smoke tests (optional):
 
@@ -227,10 +367,14 @@ uv pip install lightning-sdk
 
 uv run python launch_lightning_sweep.py \
   --machine L4 \
-  --methods pca lv lv_e gnn_e \
+  --methods lv lv_e \
   --detach-only \
   --remote-stop-after
 ```
+
+The launcher now defaults to `--methods lv lv_e` with `--epochs 15
+--final-epochs 40`, matching the sampler / likelihood grid above; pass
+`--methods pca lv lv_e gnn_e` to restore the previous full sweep.
 
 
 Omit `--detach-only` to poll from the client and download artifacts when done

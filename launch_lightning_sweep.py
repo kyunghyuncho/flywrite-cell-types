@@ -21,6 +21,8 @@ from pathlib import Path
 
 from lightning_sdk import Machine, Studio
 
+from heldout import LIKELIHOODS
+
 REPO_ROOT = Path(__file__).resolve().parent
 REMOTE_LOG = "unsup_sweep.log"
 REMOTE_DONE = "unsup_sweep.done"
@@ -35,6 +37,7 @@ CODE_FILES = [
     "train_pca_baseline.py",
     "sparse_graph_pca.py",
     "heldout.py",
+    "subgraph_sampler.py",
     "run_experiments.py",
     "evaluate_clustering.py",
     "index_mapping.py",
@@ -123,20 +126,35 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--studio-name", default="flywrite-gnn-vsbm")
     parser.add_argument("--machine", default="L4")
-    parser.add_argument("--epochs", type=int, default=5, help="HP-search LV/GNN epochs")
-    parser.add_argument("--final-epochs", type=int, default=20, help="Final LV/GNN epochs")
+    parser.add_argument("--epochs", type=int, default=15, help="HP-search LV/GNN epochs")
+    parser.add_argument("--final-epochs", type=int, default=40, help="Final LV/GNN epochs")
     parser.add_argument("--minibatch", type=int, default=2048)
     parser.add_argument("--pca-max-iter", type=int, default=2_000, help="HP-search PCA steps")
     parser.add_argument("--final-pca-max-iter", type=int, default=10_000, help="Final PCA steps")
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--pca-dims", type=int, nargs="+", default=[32, 64])
     parser.add_argument("--pca-lrs", type=float, nargs="+", default=[0.01])
-    parser.add_argument("--lv-dims", type=int, nargs="+", default=[32, 64])
-    parser.add_argument("--lv-lrs", type=float, nargs="+", default=[0.05, 0.1])
-    parser.add_argument("--lv-e-dims", type=int, nargs="+", default=[32, 64])
-    parser.add_argument("--lv-e-d-es", type=int, nargs="+", default=[16, 32])
-    parser.add_argument("--lv-e-lrs", type=float, nargs="+", default=[0.05, 0.1])
-    parser.add_argument("--lv-e-wds", type=float, nargs="+", default=[1e-3, 1e-2])
+    parser.add_argument("--lv-dims", type=int, nargs="+", default=[64])
+    parser.add_argument("--lv-lrs", type=float, nargs="+", default=[0.1])
+    parser.add_argument("--lv-bfs-fracs", type=float, nargs="+", default=[0.0, 0.5, 1.0])
+    parser.add_argument(
+        "--lv-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson", "nb"]
+    )
+    parser.add_argument("--lv-e-dims", type=int, nargs="+", default=[64])
+    parser.add_argument("--lv-e-d-es", type=int, nargs="+", default=[16])
+    parser.add_argument("--lv-e-lrs", type=float, nargs="+", default=[0.05])
+    parser.add_argument("--lv-e-wds", type=float, nargs="+", default=[1e-2])
+    parser.add_argument("--lv-e-bfs-fracs", type=float, nargs="+", default=[0.5])
+    parser.add_argument(
+        "--lv-e-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson"]
+    )
+    parser.add_argument("--bfs-seeds", type=int, default=4)
+    parser.add_argument(
+        "--lv-control-updates",
+        type=int,
+        default=0,
+        help="Total update budget for a matched-compute bfs_frac=0 LV control (0 disables)",
+    )
     parser.add_argument("--gnn-layers", type=int, nargs="+", default=[0, 1, 2, 4])
     parser.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
     parser.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
@@ -152,7 +170,7 @@ def main() -> None:
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=["pca", "lv", "lv_e", "gnn_e"],
+        default=["lv", "lv_e"],
         choices=["pca", "lv", "lv_e", "gnn", "gnn_e", "ntac"],
         help="Methods to sweep",
     )
@@ -225,10 +243,16 @@ def main() -> None:
             f"--final-pca-max-iter {args.final_pca_max_iter} "
             f"--pca-dims {join_nums(args.pca_dims)} --pca-lrs {join_nums(args.pca_lrs)} "
             f"--lv-dims {join_nums(args.lv_dims)} --lv-lrs {join_nums(args.lv_lrs)} "
+            f"--lv-bfs-fracs {join_nums(args.lv_bfs_fracs)} "
+            f"--lv-likelihoods {join_nums(args.lv_likelihoods)} "
             f"--lv-e-dims {join_nums(args.lv_e_dims)} "
             f"--lv-e-d-es {join_nums(args.lv_e_d_es)} "
             f"--lv-e-lrs {join_nums(args.lv_e_lrs)} "
             f"--lv-e-wds {join_nums(args.lv_e_wds)} "
+            f"--lv-e-bfs-fracs {join_nums(args.lv_e_bfs_fracs)} "
+            f"--lv-e-likelihoods {join_nums(args.lv_e_likelihoods)} "
+            f"--bfs-seeds {args.bfs_seeds} "
+            f"--lv-control-updates {args.lv_control_updates} "
             f"--gnn-layers {join_nums(args.gnn_layers)} --gnn-dims {join_nums(args.gnn_dims)} "
             f"--gnn-lrs {join_nums(args.gnn_lrs)} "
             f"--gnn-e-layers {join_nums(args.gnn_e_layers)} "
