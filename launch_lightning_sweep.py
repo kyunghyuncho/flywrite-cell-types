@@ -38,6 +38,7 @@ CODE_FILES = [
     "sparse_graph_pca.py",
     "heldout.py",
     "subgraph_sampler.py",
+    "training_utils.py",
     "run_experiments.py",
     "evaluate_clustering.py",
     "index_mapping.py",
@@ -149,6 +150,12 @@ def main() -> None:
         "--lv-e-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson"]
     )
     parser.add_argument("--bfs-seeds", type=int, default=4)
+    parser.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help="Global gradient-norm clip for LV / LV+e / GNN; 0 or less disables it",
+    )
     parser.add_argument(
         "--lv-control-updates",
         type=int,
@@ -272,6 +279,7 @@ def main() -> None:
             f"--lv-e-bfs-fracs {join_nums(args.lv_e_bfs_fracs)} "
             f"--lv-e-likelihoods {join_nums(args.lv_e_likelihoods)} "
             f"--bfs-seeds {args.bfs_seeds} "
+            f"--grad-clip {args.grad_clip} "
             f"--lv-control-updates {args.lv_control_updates} "
             f"--gnn-layers {join_nums(args.gnn_layers)} --gnn-dims {join_nums(args.gnn_dims)} "
             f"--gnn-lrs {join_nums(args.gnn_lrs)} "

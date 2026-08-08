@@ -307,6 +307,84 @@ Orchestration: [`run_experiments.py`](run_experiments.py). Outputs:
 `hp_results.*`, `hp_best.json`, `final_results.*`, `final_summary.*`.
 Select methods with `--methods` (e.g. `lv lv_e ntac`).
 
+### Decoder divergence, checkpoint selection, and what is actually reported
+
+At $\mathrm{lr}=0.1$ the LV edge decoder **diverges mid-run**. The failure is not
+a diverging loss: training continues, the partition survives, and only the
+observation model is destroyed. The held-out log-likelihood snaps to
+$\log\tfrac12\approx-0.69$ per pair in the degenerate direction (reported as
+$\approx-6.1$ on this split) and the held-out AUC falls to exactly $0.5$, i.e.
+the model no longer ranks any edge above any non-edge. In the $40$-epoch finals
+this happened at epoch $13$–$18$ in all three seeds of the *selected* $d=64$
+Bernoulli configuration, at epoch $5$ for $d=128$ and epoch $2$–$3$ for $d=256$;
+the negative binomial was the only likelihood that survived at every width.
+
+Three things follow, and all three are now implemented.
+
+**Global-norm clipping delays the divergence but does not prevent it.** Clipping
+at $\lVert g\rVert\le1$ was already active throughout the sweep that produced the
+divergence, so it cannot be credited with preventing it. A controlled local pair
+at $d=256$, $\mathrm{lr}=0.1$, $40$ updates per evaluation confirms both halves
+of that statement: unclipped, the held-out LL falls to $-6.34$ and the AUC to
+$0.45$ by evaluation $12$; clipped at $1$, the model is still healthy there
+(AUC $0.73$) and diverges only at evaluation $16$, ending at LL $-5.65$ /
+AUC $0.40$. Clipping buys roughly a third more training before the decoder goes,
+which is why it is worth keeping and why it is not a fix. The divergence is a
+large-step instability of Adam at this learning rate, not a gradient spike, so
+the intervention that matters is the learning rate. `--grad-clip` (default $1$,
+$\le 0$ disables) is now an explicit flag on all three trainers rather than a
+hidden constant, so the assumption is testable rather than buried.
+
+**A non-finite loss or gradient skips the update.** Previously the first bad
+step propagated through the Adam moments into every parameter and the run
+reported NaN metrics instead of failing loudly. Trainers now report
+`skipped_updates` alongside `total_updates`; a nonzero count is a warning sign
+even when the final metrics look plausible.
+
+**The reported model is the best-validation checkpoint, not the last epoch.**
+Selecting a configuration at $15$ epochs and evaluating it at $40$ meant
+reporting a model that no longer existed at selection time. Each trainer now
+retains the parameters attaining the best `val_metric`, restores them before
+extracting assignments, and records `best_epoch` plus `checkpoint` /
+`assignment_source` so the provenance of `*_assignment_dict.npy` is explicit.
+Because it is not obvious *a priori* that the divergence hurts the partition —
+the collapsed $d=64$ finals reported the best LV Hungarian yet — every run also
+scores the final epoch and writes both:
+
+| restored best checkpoint | final epoch |
+| --- | --- |
+| `val_metric`, `val_auc`, `gt_hungarian`, `gt_ari`, `gt_nmi` | `last_val_metric`, `last_val_auc`, `last_gt_hungarian`, `last_gt_ari`, `last_gt_nmi` |
+| `*_assignment_dict.npy` | `*_last_assignment_dict.npy` |
+
+That is two Hungarian computations per run against the same seed and the same
+budget, which turns "does the divergence help or hurt ground truth?" into a
+controlled within-run comparison instead of the confounded across-phase one
+($8\,460$ at $3$ seeds $\times$ $40$ epochs versus $7\,803$ at $1$ seed $\times$
+$15$ epochs). `final_summary.json` aggregates it as `hungarian_mean` versus
+`last_hungarian_mean` with their difference. Ground-truth scoring inside the
+trainers is a diagnostic only and never enters selection; `--no-gt-eval`
+switches it off.
+
+The first controlled measurement is uncomfortable. In both local $d=256$ runs
+above the *diverged* final model agrees with the visual types **better** than the
+checkpoint the validation metric selected:
+
+| run | best epoch | best LL / AUC | best Hungarian | last LL / AUC | last Hungarian |
+| --- | --- | --- | --- | --- | --- |
+| `--grad-clip 1` | $5$ | $-2.594$ / $0.713$ | $1\,505$ | $-5.645$ / $0.401$ | $1\,696$ |
+| `--grad-clip 0` | $10$ | $-2.259$ / $0.635$ | $1\,444$ | $-6.457$ / $0.471$ | $1\,937$ |
+
+Same seed, same budget, same data, so the confound in the earlier across-phase
+comparison is removed: the divergence costs the decoder everything and *gains*
+$13$–$34\%$ Hungarian. Held-out edge likelihood and partition quality are
+therefore anti-correlated in this regime — plausibly because the entropy term
+keeps sharpening $q$ into a discrete partition long after the decoder has
+stopped calibrating it — which means the unsupervised selection metric is
+selecting against the quantity of interest. These are short runs at low absolute
+Hungarian ($\approx1.5$–$1.9\times10^{3}$ against $8.5\times10^{3}$ in the
+full-budget finals), so the finding needs confirmation at full budget; both
+numbers are now emitted by every run precisely so that confirmation is free.
+
 Current LV grids fix the learning rate at the previously selected optimum and
 spend the budget on the likelihood and the rank $d$. A pilot at $5$ epochs
 established that `bfs_frac` is not worth a grid axis — Hungarian $1\,228$ at $0$,
@@ -421,6 +499,16 @@ uv run python gnn_vsbm.py --epochs 1 --max-updates 5 --layers 2 --seed 0 --out-p
 Install the SDK once, and put API keys in `~/.ortet/lightning.env`
 (`LIGHTNING_USER_ID`, `LIGHTNING_API_KEY`). GPU Studios need a verified payment method.
 
+> **Download before you launch.** `remote_start_unsup_sweep.sh` begins with
+> `rm -f hp_* final_*` on the Studio working directory, so starting any sweep
+> destroys every result file left by the previous one — metrics, assignment
+> dictionaries and summary tables alike. The deletion is deliberate (a partially
+> overwritten result set is worse than none) but it is unrecoverable: the Studio
+> is the only copy until the artifacts are pulled down. **Always download and
+> verify the previous sweep's artifacts before launching the next one**, then
+> merge them into the canonical tables with `merge_lv_results.py` /
+> `merge_ntac_results.py`.
+
 **1. Launch a detached sweep** (uploads code/data, starts `run_experiments.py` under
 `nohup`, returns immediately). By default the Studio **stops itself** when the job
 finishes, so a closed laptop still ends billing:
@@ -440,6 +528,29 @@ uv run python launch_lightning_sweep.py \
 The launcher now defaults to `--methods lv lv_e` with `--epochs 15
 --final-epochs 40`, matching the sampler / likelihood grid above; pass
 `--methods pca lv lv_e gnn_e` to restore the previous full sweep.
+`--grad-clip` is forwarded to `run_experiments.py` and from there to every LV /
+LV+$e$ / GNN trainer.
+
+**LV rerun at a stable learning rate.** Given the divergence above, the LV arm is
+re-run at $\mathrm{lr}\in\{0.01,0.03\}$ across $d\in\{64,128,256\}$ — $d=64$
+included, since it diverges too, merely later (epoch $13$–$18$ rather than
+epoch $2$). Selection stays on the held-out Bernoulli log-likelihood; HP search
+and finals now use the same $40$-epoch budget so the selected model is the model
+that is evaluated:
+
+```bash
+uv run python launch_lightning_sweep.py \
+  --machine L4 --methods lv \
+  --lv-lrs 0.01 0.03 --lv-dims 64 128 256 \
+  --lv-likelihoods bernoulli poisson nb --lv-bfs-fracs 1.0 \
+  --grad-clip 1.0 --epochs 40 --final-epochs 40 --final-seeds 0 1 2 \
+  --detach-only --remote-stop-after
+```
+
+That is $2\times3\times3=18$ HP runs plus $3$ multi-seed finals, all at $40$
+epochs. Matching the two budgets is what removes the selection inconsistency,
+and it is the expensive part; drop `--lv-likelihoods` to `bernoulli nb` if the
+budget is tight, since Poisson was the weakest arm at every width.
 
 **Auto-sleep.** The Studio ships with idle auto-sleep enabled at the platform
 default, and a detached `nohup` sweep does not reliably register as activity: an

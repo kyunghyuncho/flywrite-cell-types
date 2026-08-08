@@ -79,6 +79,25 @@ def evaluate_pair(pred: dict[Any, Any], gt: dict[Any, Any]) -> dict[str, float]:
     }
 
 
+def score_assignment_dict(
+    pred: dict[Any, Any],
+    gt_path: Path | str | None,
+) -> dict[str, float] | None:
+    """Score an in-memory assignment dict against ground truth, or ``None`` if unavailable.
+
+    Trainers call this purely as a diagnostic: model selection uses the held-out
+    likelihood only, and these numbers never feed back into it. Returning
+    ``None`` when the ground-truth pickle is absent keeps a trainer runnable on
+    machines that carry the graph but not the type labels.
+    """
+    if gt_path is None:
+        return None
+    path = Path(gt_path)
+    if not path.exists():
+        return None
+    return evaluate_pair(pred, load_ground_truth(path))
+
+
 def random_assignment_baseline(
     gt_labels: np.ndarray,
     k: int = 729,

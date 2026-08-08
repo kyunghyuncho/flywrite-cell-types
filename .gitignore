@@ -19,6 +19,7 @@ final_summary.json
 ntac_hp_best.json
 ntac_hp_results.json
 *.prentac.bak
+*.prelv.bak
 heldout_pairs.npz
 heldout_rows.npz
 *_metrics.json

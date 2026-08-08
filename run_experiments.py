@@ -138,6 +138,8 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                     str(args.bfs_seeds),
                                     "--likelihood",
                                     likelihood,
+                                    "--grad-clip",
+                                    str(args.grad_clip),
                                     "--epochs",
                                     str(args.epochs),
                                     "--minibatch",
@@ -192,6 +194,8 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                 str(args.bfs_seeds),
                                 "--likelihood",
                                 likelihood,
+                                "--grad-clip",
+                                str(args.grad_clip),
                                 "--target-updates",
                                 str(args.lv_control_updates),
                                 "--epochs",
@@ -254,6 +258,8 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                             str(args.bfs_seeds),
                                             "--likelihood",
                                             likelihood,
+                                            "--grad-clip",
+                                            str(args.grad_clip),
                                             "--epochs",
                                             str(args.epochs),
                                             "--minibatch",
@@ -309,6 +315,8 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                         likelihood,
                                         "--propagation",
                                         args.gnn_propagation,
+                                        "--grad-clip",
+                                        str(args.grad_clip),
                                         "--epochs",
                                         str(args.epochs),
                                         "--minibatch",
@@ -462,6 +470,8 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     str(args.bfs_seeds),
                     "--likelihood",
                     str(hp["likelihood"]),
+                    "--grad-clip",
+                    str(args.grad_clip),
                     "--minibatch",
                     str(args.minibatch),
                     "--seed",
@@ -503,6 +513,8 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     str(args.bfs_seeds),
                     "--likelihood",
                     str(hp["likelihood"]),
+                    "--grad-clip",
+                    str(args.grad_clip),
                     "--epochs",
                     str(args.final_epochs),
                     "--minibatch",
@@ -573,6 +585,8 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     str(hp["likelihood"]),
                     "--propagation",
                     str(hp.get("propagation", args.gnn_propagation)),
+                    "--grad-clip",
+                    str(args.grad_clip),
                     "--epochs",
                     str(args.final_epochs),
                     "--minibatch",
@@ -628,6 +642,49 @@ def read_metrics(prefix: str) -> dict:
     return json.loads(path.read_text())
 
 
+# Reported alongside the selection metric so a run that diverged mid-training is
+# visible in the tables rather than only in its log.
+DIAGNOSTIC_KEYS = (
+    "val_auc",
+    "last_val_metric",
+    "last_val_auc",
+    "checkpoint",
+    "best_epoch",
+    "last_epoch",
+    "grad_clip",
+    "skipped_updates",
+)
+
+
+def diagnostics(prefix: str, metrics: dict, gt: dict) -> dict:
+    """Best-vs-last diagnostics for one run, including ground truth at both states.
+
+    The trainers already score both states; this recomputes ``last_gt_*`` from the
+    saved last-epoch assignment dict only when they were run with GT scoring off.
+    """
+    row = {k: metrics[k] for k in DIAGNOSTIC_KEYS if k in metrics}
+    last_gt = {k: v for k, v in metrics.items() if k.startswith("last_gt_")}
+    if not last_gt:
+        last_path = Path(f"{prefix}_last_assignment_dict.npy")
+        if last_path.exists():
+            scored = evaluate_pair(load_assignment_dict(last_path), gt)
+            last_gt = {f"last_gt_{k}": v for k, v in scored.items()}
+    row.update(last_gt)
+    return row
+
+
+def best_vs_last(row: dict) -> str:
+    """One-line summary of what the best-val checkpoint bought over the last epoch."""
+    if "last_gt_hungarian" not in row:
+        return ""
+    return (
+        f" | last: val={row.get('last_val_metric', float('nan')):.6f} "
+        f"auc={row.get('last_val_auc', float('nan')):.4f} "
+        f"gt_hungarian={row['last_gt_hungarian']:.1f} "
+        f"(best epoch {row.get('best_epoch')})"
+    )
+
+
 def pred_path_for(prefix: str) -> Path:
     for cand in (f"{prefix}_assignment_dict.npy", f"{prefix}_assignment_dict_729.npy"):
         p = Path(cand)
@@ -681,6 +738,16 @@ def main() -> None:
     )
     p.add_argument(
         "--bfs-seeds", type=int, default=4, help="BFS seeds per expansion round (LV / LV+e / GNN)"
+    )
+    p.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help=(
+            "Global gradient-norm clip for LV / LV+e / GNN; 0 or less disables it. "
+            "Clipping alone does not prevent the lr=0.1 decoder divergence, so pair "
+            "it with a smaller --lv-lrs"
+        ),
     )
     p.add_argument(
         "--lv-control-updates",
@@ -757,10 +824,11 @@ def main() -> None:
             pred = load_assignment_dict(pred_path_for(spec.prefix))
             gt_metrics = evaluate_pair(pred, gt)
             row.update({f"gt_{k}": v for k, v in gt_metrics.items()})
+            row.update(diagnostics(spec.prefix, metrics, gt))
             hp_rows.append(row)
             print(
                 f"HP {spec.name}: val={row['val_metric']:.6f} "
-                f"gt_hungarian={row['gt_hungarian']:.1f}"
+                f"gt_hungarian={row['gt_hungarian']:.1f}" + best_vs_last(row)
             )
 
         for method in args.methods:
@@ -831,11 +899,12 @@ def main() -> None:
                 "val_native_ll": metrics.get("val_native_ll"),
                 "val_native_ll_name": metrics.get("val_native_ll_name"),
                 **{f"gt_{k}": v for k, v in gt_metrics.items()},
+                **diagnostics(spec.prefix, metrics, gt),
             }
             final_rows.append(row)
             print(
                 f"FINAL {spec.name}: val={row['val_metric']:.6f} "
-                f"gt_hungarian={row['gt_hungarian']:.1f}"
+                f"gt_hungarian={row['gt_hungarian']:.1f}" + best_vs_last(row)
             )
 
         Path("final_results.json").write_text(json.dumps(final_rows, indent=2))
@@ -852,20 +921,27 @@ def main() -> None:
             hun = np.array([r["gt_hungarian"] for r in sub], dtype=float)
             ari = np.array([r["gt_ari"] for r in sub], dtype=float)
             nmi = np.array([r["gt_nmi"] for r in sub], dtype=float)
-            summary.append(
-                {
-                    "method": method,
-                    "n_seeds": len(sub),
-                    "hungarian_mean": float(hun.mean()),
-                    "hungarian_std": float(hun.std(ddof=1)) if len(sub) > 1 else 0.0,
-                    "ari_mean": float(ari.mean()),
-                    "ari_std": float(ari.std(ddof=1)) if len(sub) > 1 else 0.0,
-                    "nmi_mean": float(nmi.mean()),
-                    "nmi_std": float(nmi.std(ddof=1)) if len(sub) > 1 else 0.0,
-                    "best_hyperparams": best_by_method[method]["hyperparams"],
-                    "selection_val_metric": best_by_method[method]["val_metric"],
-                }
-            )
+            entry = {
+                "method": method,
+                "n_seeds": len(sub),
+                "hungarian_mean": float(hun.mean()),
+                "hungarian_std": float(hun.std(ddof=1)) if len(sub) > 1 else 0.0,
+                "ari_mean": float(ari.mean()),
+                "ari_std": float(ari.std(ddof=1)) if len(sub) > 1 else 0.0,
+                "nmi_mean": float(nmi.mean()),
+                "nmi_std": float(nmi.std(ddof=1)) if len(sub) > 1 else 0.0,
+                "best_hyperparams": best_by_method[method]["hyperparams"],
+                "selection_val_metric": best_by_method[method]["val_metric"],
+            }
+            # Same seeds, same budget: the controlled answer to whether restoring the
+            # best-validation checkpoint costs or buys ground-truth agreement.
+            last_hun = [r["last_gt_hungarian"] for r in sub if "last_gt_hungarian" in r]
+            if last_hun:
+                arr = np.array(last_hun, dtype=float)
+                entry["last_hungarian_mean"] = float(arr.mean())
+                entry["last_hungarian_std"] = float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
+                entry["hungarian_best_minus_last"] = entry["hungarian_mean"] - float(arr.mean())
+            summary.append(entry)
             print(
                 f"SUMMARY {method}: Hungarian "
                 f"{summary[-1]['hungarian_mean']:.1f} ± {summary[-1]['hungarian_std']:.1f}"

@@ -12,6 +12,13 @@ cluster-pair grid. With ``--likelihood {poisson,nb}`` the adjacency is *not*
 binarized and the same linear predictor $\\eta_{kk'}$ is read as a log-rate;
 model selection nonetheless remains the held-out **Bernoulli** log-likelihood so
 that ``val_metric`` is comparable across likelihoods.
+
+The reported model is the one attaining the best ``val_metric`` over epochs, not
+the last one: at large learning rates the decoder diverges mid-run and the final
+parameters score at chance. Ground-truth agreement is recorded at *both* the
+restored best checkpoint (``gt_*``) and the final epoch (``last_gt_*``) so the
+cost of that divergence can be read off directly; neither quantity participates
+in selection.
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -26,6 +34,7 @@ from scipy.sparse import csr_matrix, load_npz
 from torch import nn
 from tqdm import tqdm
 
+from evaluate_clustering import score_assignment_dict
 from heldout import (
     LIKELIHOODS,
     clamp_eta,
@@ -43,6 +52,25 @@ from heldout import (
 )
 from index_mapping import load_mapping
 from subgraph_sampler import SubgraphBatchSampler
+from training_utils import (
+    BestCheckpoint,
+    checkpoint_metrics,
+    prefixed,
+    resolve_grad_clip,
+    safe_optimizer_step,
+)
+
+
+class Snapshot(NamedTuple):
+    """Everything reported about one parameter state (best checkpoint or last epoch)."""
+
+    assignments: np.ndarray
+    scores: np.ndarray
+    assignment_dict: dict
+    val_ll: float
+    native_ll: float
+    val_auc: float
+    gt: dict[str, float] | None
 
 
 def pick_device(requested: str | None) -> str:
@@ -205,6 +233,14 @@ def train(args: argparse.Namespace) -> dict:
     if args.likelihood == "nb":
         params.append(log_r)
     optimizer = torch.optim.Adam(params, lr=args.lr)
+    grad_clip = resolve_grad_clip(args.grad_clip)
+    state = {
+        "u_left": u_left,
+        "u_right": u_right,
+        "bias": bias,
+        "q_logits": q_logits,
+        "log_r": log_r,
+    }
     sampler = SubgraphBatchSampler(
         adj,
         batch_size=args.minibatch,
@@ -212,9 +248,11 @@ def train(args: argparse.Namespace) -> dict:
         n_seeds=args.bfs_seeds,
         seed=args.seed,
     )
-    best_val = -float("inf")
+    checkpoint = BestCheckpoint()
     cum_pos_obs = 0
     total_updates = 0
+    n_skipped = 0
+    last_epoch = -1
     # A coverage-defined epoch is longer at higher bfs_frac, so an update budget is
     # what makes compute comparable across bfs_frac.
     epochs = args.epochs if args.target_updates is None else 10**9
@@ -224,6 +262,7 @@ def train(args: argparse.Namespace) -> dict:
             if args.target_updates is not None and total_updates >= args.target_updates:
                 break
             loss_sum = 0.0
+            n_scored = 0
             n_batches = 0
             epoch_pos_obs = 0
 
@@ -256,58 +295,86 @@ def train(args: argparse.Namespace) -> dict:
                 obj = obj * (idx.size * idx.size) / n_keep.clamp(min=1)
                 loss = -obj
 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
-                optimizer.step()
+                if not safe_optimizer_step(loss, params, optimizer, grad_clip):
+                    n_skipped += 1
+                    continue
                 loss_sum += float(loss.item())
+                n_scored += 1
 
-            mean_loss = loss_sum / max(n_batches, 1)
+            mean_loss = loss_sum / max(n_scored, 1)
             cum_pos_obs += epoch_pos_obs
+            last_epoch = epoch
             print(sampler.coverage_line(epoch, n_batches, epoch_pos_obs, cum_pos_obs, nnz))
             val_ll, _, val_auc = eval_heldout(
                 q_logits, u_left, u_right, bias, log_r, held, None, args.likelihood, device, dtype
             )
-            best_val = max(best_val, val_ll)
+            checkpoint.update(val_ll, epoch, state)
             n_used = int(torch.unique(torch.argmax(q_logits, dim=-1)).numel())
             print(
                 f"loss={mean_loss:.4f} val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
-                f"best_val_ll={best_val:.6f} clusters={n_used}/{args.k} "
-                f"updates={total_updates}"
+                f"best_val_ll={checkpoint.metric:.6f}@{checkpoint.epoch} "
+                f"clusters={n_used}/{args.k} "
+                f"updates={total_updates} skipped={n_skipped}"
             )
     except KeyboardInterrupt:
         print("Training interrupted.")
 
-    with torch.no_grad():
-        assignments = torch.argmax(q_logits, dim=-1).cpu().numpy()
-        scores = torch.max(torch.softmax(q_logits, dim=-1), dim=-1).values.cpu().numpy()
-        val_ll, native_ll, val_auc = eval_heldout(
-            q_logits,
-            u_left,
-            u_right,
-            bias,
-            log_r,
-            held,
-            held_counts,
-            args.likelihood,
-            device,
-            dtype,
+    mapping = load_mapping(args.mapping)
+    gt_path = None if args.no_gt_eval else args.gt
+
+    def snapshot() -> Snapshot:
+        with torch.no_grad():
+            assignments = torch.argmax(q_logits, dim=-1).cpu().numpy()
+            scores = torch.max(torch.softmax(q_logits, dim=-1), dim=-1).values.cpu().numpy()
+            val_ll, native_ll, val_auc = eval_heldout(
+                q_logits,
+                u_left,
+                u_right,
+                bias,
+                log_r,
+                held,
+                held_counts,
+                args.likelihood,
+                device,
+                dtype,
+            )
+        pred = {mapping[i]: int(assignments[i]) for i in range(len(assignments))}
+        return Snapshot(
+            assignments,
+            scores,
+            pred,
+            val_ll,
+            native_ll,
+            val_auc,
+            score_assignment_dict(pred, gt_path),
         )
 
-    mapping = load_mapping(args.mapping)
-    cluster_assignment_dict = {mapping[i]: int(assignments[i]) for i in range(len(assignments))}
+    # Evaluate the final parameters before restoring, so the cost of any mid-run
+    # divergence is measurable rather than inferred.
+    last = snapshot()
+    restored = checkpoint.epoch != last_epoch and checkpoint.restore(state)
+    best = snapshot() if restored else last
+
     prefix = Path(args.out_prefix)
-    np.save(f"{prefix}_assignments.npy", assignments)
-    np.save(f"{prefix}_scores.npy", scores)
-    np.save(f"{prefix}_assignment_dict.npy", cluster_assignment_dict)
+    np.save(f"{prefix}_assignments.npy", best.assignments)
+    np.save(f"{prefix}_scores.npy", best.scores)
+    np.save(f"{prefix}_assignment_dict.npy", best.assignment_dict)
+    if best is not last:
+        np.save(f"{prefix}_last_assignment_dict.npy", last.assignment_dict)
     metrics = {
         "method": "lv_vsbm",
-        "val_metric": val_ll,
+        "val_metric": best.val_ll,
         "val_metric_name": "heldout_bernoulli_ll",
         "val_metric_higher_is_better": True,
-        "val_native_ll": native_ll,
+        "val_native_ll": best.native_ll,
         "val_native_ll_name": native_ll_name(args.likelihood),
-        "val_auc": val_auc,
+        "val_auc": best.val_auc,
+        "last_val_metric": last.val_ll,
+        "last_val_native_ll": last.native_ll,
+        "last_val_auc": last.val_auc,
+        **checkpoint_metrics(checkpoint, last_epoch),
+        **prefixed(best.gt, "gt_"),
+        **prefixed(last.gt, "last_gt_"),
         "seed": args.seed,
         "k": args.k,
         "d": args.d,
@@ -316,14 +383,22 @@ def train(args: argparse.Namespace) -> dict:
         "likelihood": args.likelihood,
         "bfs_frac": args.bfs_frac,
         "bfs_seeds": args.bfs_seeds,
+        "grad_clip": grad_clip,
         "edges_seen_x_nnz": cum_pos_obs / max(nnz, 1),
         "total_updates": total_updates,
+        "skipped_updates": n_skipped,
         "target_updates": args.target_updates,
         "nb_r": float(torch.exp(log_r).item()) if args.likelihood == "nb" else None,
-        "n_pred_clusters": int(len(np.unique(assignments))),
+        "n_pred_clusters": int(len(np.unique(best.assignments))),
+        "last_n_pred_clusters": int(len(np.unique(last.assignments))),
     }
     write_metrics(f"{prefix}_metrics.json", metrics)
-    print(f"Saved {prefix}_* ; val_ll={val_ll:.6f} native_ll={native_ll:.6f} val_auc={val_auc:.4f}")
+    print(
+        f"Saved {prefix}_* from the {metrics['checkpoint']} model "
+        f"(epoch {metrics['best_epoch']}); val_ll={best.val_ll:.6f} "
+        f"native_ll={best.native_ll:.6f} val_auc={best.val_auc:.4f} "
+        f"| last val_ll={last.val_ll:.6f} val_auc={last.val_auc:.4f}"
+    )
     return metrics
 
 
@@ -357,6 +432,22 @@ def build_argparser() -> argparse.ArgumentParser:
         choices=LIKELIHOODS,
         default="bernoulli",
         help="Edge likelihood; count models use unbinarized synapse counts",
+    )
+    p.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help="Global gradient-norm clip applied before each step; 0 or less disables it",
+    )
+    p.add_argument(
+        "--gt",
+        default="root_id_type_dict.pkl",
+        help="Ground-truth types, scored as a diagnostic only (never used for selection)",
+    )
+    p.add_argument(
+        "--no-gt-eval",
+        action="store_true",
+        help="Skip the diagnostic ground-truth scoring of the best and last models",
     )
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", default=None)

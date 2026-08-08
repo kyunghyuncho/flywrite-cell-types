@@ -36,6 +36,11 @@ distinction cannot silently drift.
 
 Boundary nodes of $S$ see truncated neighborhoods, which is the accepted cost of
 this scheme; no GraphSAINT normalization coefficients or halo hops are applied.
+
+As in the LV trainers, the reported model is the epoch attaining the best
+``val_metric`` rather than the last one, and ground-truth agreement is recorded
+at both that checkpoint (``gt_*``) and the final epoch (``last_gt_*``) as a
+diagnostic that never feeds selection.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -51,6 +57,7 @@ from scipy.sparse import csr_matrix, load_npz
 from torch import nn
 from tqdm import tqdm
 
+from evaluate_clustering import score_assignment_dict
 from heldout import (
     LIKELIHOODS,
     heldout_pair_mask,
@@ -68,6 +75,28 @@ from heldout import (
 )
 from index_mapping import load_mapping
 from subgraph_sampler import SubgraphBatchSampler
+from training_utils import (
+    BestCheckpoint,
+    checkpoint_metrics,
+    prefixed,
+    resolve_grad_clip,
+    safe_optimizer_step,
+)
+
+
+class Snapshot(NamedTuple):
+    """Everything reported about one parameter state (best checkpoint or last epoch)."""
+
+    assignments: np.ndarray
+    scores: np.ndarray
+    u: np.ndarray
+    assignment_dict: dict
+    val_ll: float
+    native_ll: float
+    val_auc: float
+    gamma: float
+    gt: dict[str, float] | None
+
 
 # Empirically measured undirected hop-ball sizes (excl. self) on FlyWire A.
 HOP_BALL_NOTE = (
@@ -392,6 +421,8 @@ def train(args: argparse.Namespace) -> dict:
     if args.likelihood == "nb":
         params.append(model.log_r)
     optimizer = torch.optim.Adam(params, lr=args.lr)
+    grad_clip = resolve_grad_clip(args.grad_clip)
+    state = dict(model.named_parameters())
     sampler = SubgraphBatchSampler(
         adj_bin,
         batch_size=args.minibatch,
@@ -399,10 +430,11 @@ def train(args: argparse.Namespace) -> dict:
         n_seeds=args.bfs_seeds,
         seed=args.seed,
     )
-    best_val = -float("inf")
+    checkpoint = BestCheckpoint()
     cum_pos_obs = 0
     total_updates = 0
     n_skipped = 0
+    last_epoch = -1
     # A coverage-defined epoch is longer at higher bfs_frac, so an update budget is
     # what makes compute comparable across bfs_frac.
     epochs = args.epochs if args.target_updates is None else 10**9
@@ -471,26 +503,17 @@ def train(args: argparse.Namespace) -> dict:
                 ll = ((ll_pairs * keep).sum() / n_keep.clamp(min=1.0)) * float(idx.size * idx.size)
                 entropy = args.entropy_weight * -(alpha * log_clamp(alpha)).sum(1).mean()
                 loss = -(ll + entropy)
-                if not torch.isfinite(loss):
+                # Without this guard the first bad gradient poisons every parameter
+                # and the run silently reports NaN metrics instead of failing loudly.
+                if not safe_optimizer_step(loss, params, optimizer, grad_clip):
                     n_skipped += 1
-                    optimizer.zero_grad(set_to_none=True)
                     continue
-
-                optimizer.zero_grad()
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
-                if not torch.isfinite(grad_norm):
-                    # Without this the first bad gradient poisons every parameter and
-                    # the run silently reports NaN metrics instead of failing loudly.
-                    n_skipped += 1
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-                optimizer.step()
                 loss_sum += float(loss.item())
                 n_scored += 1
 
             mean_loss = loss_sum / max(n_scored, 1)
             cum_pos_obs += epoch_pos_obs
+            last_epoch = epoch
             print(sampler.coverage_line(epoch, n_batches, epoch_pos_obs, cum_pos_obs, nnz))
             block_deg = block_edges / max(block_nodes, 1)
             print(
@@ -503,14 +526,15 @@ def train(args: argparse.Namespace) -> dict:
             val_ll, _, val_auc = eval_heldout(
                 model, a_out_full, a_in_full, held, None, args.likelihood, device, dtype
             )
-            best_val = max(best_val, val_ll)
+            checkpoint.update(val_ll, epoch, state)
             with torch.no_grad():
                 n_used = int(torch.unique(torch.argmax(model.q_logits, dim=-1)).numel())
                 gamma = float(model.gamma.item())
             print(f"[gamma] epoch={epoch} gamma={gamma:.6f}")
             print(
                 f"loss={mean_loss:.4f} val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
-                f"best_val_ll={best_val:.6f} gamma={gamma:.6f} clusters={n_used}/{args.k} "
+                f"best_val_ll={checkpoint.metric:.6f}@{checkpoint.epoch} gamma={gamma:.6f} "
+                f"clusters={n_used}/{args.k} "
                 f"updates={total_updates} skipped={n_skipped}"
             )
     except KeyboardInterrupt:
@@ -530,6 +554,10 @@ def train(args: argparse.Namespace) -> dict:
         nnz,
         total_updates,
         n_skipped,
+        grad_clip,
+        checkpoint,
+        state,
+        last_epoch,
         args,
     )
 
@@ -584,38 +612,70 @@ def save_results(
     nnz: int,
     total_updates: int,
     n_skipped: int,
+    grad_clip: float | None,
+    checkpoint: BestCheckpoint,
+    state: dict[str, torch.Tensor],
+    last_epoch: int,
     args: argparse.Namespace,
 ) -> dict:
-    with torch.no_grad():
-        assignments = torch.argmax(model.q_logits, dim=-1).cpu().numpy()
-        scores = torch.max(torch.softmax(model.q_logits, dim=-1), dim=-1).values.cpu().numpy()
-        u = model.u.detach().cpu().numpy()
-        val_ll, native_ll, val_auc = eval_heldout(
-            model, a_out, a_in, held, held_counts, args.likelihood, device, dtype
-        )
-        gamma = float(model.gamma.item())
-
     mapping = load_mapping(str(mapping_path))
-    cluster_assignment_dict = {mapping[i]: int(assignments[i]) for i in range(len(assignments))}
+    gt_path = None if args.no_gt_eval else args.gt
 
-    np.save(f"{out_prefix}_assignments.npy", assignments)
-    np.save(f"{out_prefix}_scores.npy", scores)
-    np.save(f"{out_prefix}_U.npy", u)
-    np.save(f"{out_prefix}_assignment_dict.npy", cluster_assignment_dict)
+    def snapshot() -> Snapshot:
+        with torch.no_grad():
+            assignments = torch.argmax(model.q_logits, dim=-1).cpu().numpy()
+            scores = torch.max(torch.softmax(model.q_logits, dim=-1), dim=-1).values.cpu().numpy()
+            u = model.u.detach().cpu().numpy()
+            val_ll, native_ll, val_auc = eval_heldout(
+                model, a_out, a_in, held, held_counts, args.likelihood, device, dtype
+            )
+            gamma = float(model.gamma.item())
+        pred = {mapping[i]: int(assignments[i]) for i in range(len(assignments))}
+        return Snapshot(
+            assignments,
+            scores,
+            u,
+            pred,
+            val_ll,
+            native_ll,
+            val_auc,
+            gamma,
+            score_assignment_dict(pred, gt_path),
+        )
+
+    # Evaluate the final parameters before restoring, so the cost of any mid-run
+    # divergence is measurable rather than inferred.
+    last = snapshot()
+    restored = checkpoint.epoch != last_epoch and checkpoint.restore(state)
+    best = snapshot() if restored else last
+
+    np.save(f"{out_prefix}_assignments.npy", best.assignments)
+    np.save(f"{out_prefix}_scores.npy", best.scores)
+    np.save(f"{out_prefix}_U.npy", best.u)
+    np.save(f"{out_prefix}_assignment_dict.npy", best.assignment_dict)
+    if best is not last:
+        np.save(f"{out_prefix}_last_assignment_dict.npy", last.assignment_dict)
     metrics = {
         "method": "gnn_vsbm",
-        "val_metric": val_ll,
+        "val_metric": best.val_ll,
         "val_metric_name": "heldout_bernoulli_ll",
         "val_metric_higher_is_better": True,
-        "val_native_ll": native_ll,
+        "val_native_ll": best.native_ll,
         "val_native_ll_name": native_ll_name(args.likelihood),
-        "val_auc": val_auc,
+        "val_auc": best.val_auc,
+        "last_val_metric": last.val_ll,
+        "last_val_native_ll": last.native_ll,
+        "last_val_auc": last.val_auc,
+        **checkpoint_metrics(checkpoint, last_epoch),
+        **prefixed(best.gt, "gt_"),
+        **prefixed(last.gt, "last_gt_"),
         "seed": args.seed,
         "k": args.k,
         "d": args.d,
         "layers": args.layers,
         "lr": args.lr,
-        "gamma": gamma,
+        "gamma": best.gamma,
+        "last_gamma": last.gamma,
         "gamma_init": args.gamma_init,
         "entropy_weight": args.entropy_weight,
         "epochs": args.epochs,
@@ -623,17 +683,21 @@ def save_results(
         "bfs_frac": args.bfs_frac,
         "bfs_seeds": args.bfs_seeds,
         "propagation": args.propagation,
+        "grad_clip": grad_clip,
         "edges_seen_x_nnz": cum_pos_obs / max(nnz, 1),
         "total_updates": total_updates,
         "skipped_updates": n_skipped,
         "target_updates": args.target_updates,
         "nb_r": float(torch.exp(model.log_r).item()) if args.likelihood == "nb" else None,
-        "n_pred_clusters": int(len(np.unique(assignments))),
+        "n_pred_clusters": int(len(np.unique(best.assignments))),
+        "last_n_pred_clusters": int(len(np.unique(last.assignments))),
     }
     write_metrics(f"{out_prefix}_metrics.json", metrics)
     print(
-        f"Saved {out_prefix}_* ; val_ll={val_ll:.6f} native_ll={native_ll:.6f} "
-        f"val_auc={val_auc:.4f} gamma={gamma:.6f}"
+        f"Saved {out_prefix}_* from the {metrics['checkpoint']} model "
+        f"(epoch {metrics['best_epoch']}); val_ll={best.val_ll:.6f} "
+        f"native_ll={best.native_ll:.6f} val_auc={best.val_auc:.4f} gamma={best.gamma:.6f} "
+        f"| last val_ll={last.val_ll:.6f} val_auc={last.val_auc:.4f}"
     )
     return metrics
 
@@ -682,7 +746,22 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--gamma-init", type=float, default=0.0, help="Init for residual GNN mix")
     p.add_argument("--entropy-weight", type=float, default=1.0)
-    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help="Global gradient-norm clip applied before each step; 0 or less disables it",
+    )
+    p.add_argument(
+        "--gt",
+        default="root_id_type_dict.pkl",
+        help="Ground-truth types, scored as a diagnostic only (never used for selection)",
+    )
+    p.add_argument(
+        "--no-gt-eval",
+        action="store_true",
+        help="Skip the diagnostic ground-truth scoring of the best and last models",
+    )
     p.add_argument(
         "--no-edge-mask",
         action="store_true",
