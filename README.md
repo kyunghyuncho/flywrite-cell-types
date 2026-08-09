@@ -40,8 +40,8 @@ mattered, what did not, and which pieces of code embody each lesson.
      a correctly calibrated sparse model scores poorly on LL from epoch $0$.
 
 Together these take LV from Hungarian $\approx 2\,500$ (uniform minibatches,
-unconstrained decoder, LL selection) to $\approx 24\,300$–$25\,800$ on the
-shared labelled neurons.
+unconstrained decoder, LL selection) to $\approx 25\,100$ on the shared
+labelled neurons (multi-seed mean under AUC selection).
 
 ### What did not matter
 
@@ -52,7 +52,7 @@ shared labelled neurons.
 2. **Graph neural nets over soft assignments (or over $e_i$).** A multi-hop
    residual GNN, once stabilised, became a better edge model and a worse
    cell-type model. Its best stabilised single-seed arm reached Hungarian
-   $\approx 15\,700$ against LV's $\approx 24\,300$, and its held-out
+   $\approx 15\,700$ against LV's $\approx 25\,100$, and its held-out
    likelihood was *negatively* correlated with ground truth. Selecting by the
    unsupervised objective therefore preferred its worst clusterings. The GNN
    and $e_i$ trainers have been removed from this branch so the teaching
@@ -72,22 +72,25 @@ chosen by a held-out metric only; the ground-truth column is a report, never a
 selection criterion. Theoretical maximum Hungarian is $46\,479$; a random
 $K=729$ assignment scores $\approx 980$.
 
-| method | Hungarian (mean $\pm$ std) | fraction of $46\,479$ | ARI | NMI | seeds |
-| --- | --- | --- | --- | --- | --- |
-| Unseeded NTAC | $30\,654.5 \pm 24.7$ | $66.0\%$ | $0.676$ | $0.878$ | $2$ |
-| **LV vSBM (BFS + unit-norm + AUC)** | $\mathbf{24\,300.0 \pm 971.6}$ | $\mathbf{52.3\%}$ | $0.488$ | $0.822$ | $3$ |
-| LV, unconstrained decoder (same sampler) | $8\,459.7 \pm 354.1$ | $18.2\%$ | $0.177$ | $0.509$ | $3$ |
-| LV $+\,e_i$ (negative result; removed) | $5\,216.3 \pm 89.2$ | $11.2\%$ | $0.042$ | $0.373$ | $3$ |
-| LV, uniform minibatches | $2\,546.0 \pm 392.0$ | $5.5\%$ | $0.046$ | $0.224$ | $3$ |
-| PCA $+\,k$-means | $1\,355.0 \pm 88.8$ | $2.9\%$ | $0.008$ | $0.225$ | $3$ |
-| random $K=729$ assignment | $980.0 \pm 8.0$ | $2.1\%$ | $0.000$ | $0.202$ | $20$ |
+| method | Hungarian (mean $\pm$ std) | fraction of $46\,479$ | ARI | NMI | $K_{\mathrm{pred}}$ (labelled) | seeds |
+| --- | --- | --- | --- | --- | --- | --- |
+| Unseeded NTAC | $30\,654.5 \pm 24.7$ | $66.0\%$ | $0.676$ | $0.878$ | $\approx 226$–$260$ | $2$ |
+| **LV vSBM (BFS + unit-norm + AUC)** | $\mathbf{25\,095.3 \pm 911.6}$ | $\mathbf{54.0\%}$ | $0.522$ | $0.828$ | $\approx 383$–$481$ | $3$ |
+| LV, earlier unit-norm sweep ($d=256$, LL-selected) | $24\,300.0 \pm 971.6$ | $52.3\%$ | $0.488$ | $0.822$ | $\approx 388$–$484$ | $3$ |
+| LV, unconstrained decoder (same sampler) | $8\,459.7 \pm 354.1$ | $18.2\%$ | $0.177$ | $0.509$ | — | $3$ |
+| LV $+\,e_i$ (negative result; removed) | $5\,216.3 \pm 89.2$ | $11.2\%$ | $0.042$ | $0.373$ | — | $3$ |
+| LV, uniform minibatches | $2\,546.0 \pm 392.0$ | $5.5\%$ | $0.046$ | $0.224$ | — | $3$ |
+| PCA $+\,k$-means | $1\,355.0 \pm 88.8$ | $2.9\%$ | $0.008$ | $0.225$ | — | $3$ |
+| random $K=729$ assignment | $980.0 \pm 8.0$ | $2.1\%$ | $0.000$ | $0.202$ | $729$ (by construction) | $20$ |
 
-The selected LV configuration in the unit-norm sweep is
-`d=256, lr=0.03, bernoulli, bfs_frac=1.0, --u-norm unit --u-scale fixed
---u-scale-init 12`, $40$ epochs, seeds $0/1/2`. A follow-up width sweep at
-$d\in\{512,1024,2048\}$ with `--select-metric auc` has reached single-seed
-Hungarian $25\,769$ at `d=1024, lr=0.03, scale=12` (HP stage; multi-seed
-finals pending). NTAC remains ahead; closing that gap is open.
+The headline LV configuration (AUC-selected width sweep) is
+`d=512, lr=0.03, bernoulli, bfs_frac=1.0, --u-norm unit --u-scale fixed
+--u-scale-init 16, --select-metric auc`, $40$ epochs, seeds $0/1/2$; held-out
+AUC $0.980\pm0.001$. On the HP grid, the best single-seed Hungarian was
+$25\,769$ at `d=1024, lr=0.03, scale=12`, which AUC did not select — another
+reminder that the proxy and the scientific target can disagree within a strong
+regime. NTAC remains ahead and is coarser ($K_{\mathrm{pred}}$); Hungarian is
+not resolution-matched across rows. Closing the gap is open.
 
 ## Data
 
