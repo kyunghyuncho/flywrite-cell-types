@@ -12,9 +12,18 @@ Hop features are combined with Jumping Knowledge (concat of
 receptive field without erasing 0-hop cluster identity.
 
 The only free per-node parameter is ``q_logits``: unlike the ``+e`` variants
-there is no residual table that can explain an edge while bypassing cluster
-identity, so held-out likelihood gains have to be routed through the
-assignments.
+there is no residual *table* that can explain an edge while bypassing cluster
+identity. That is a weaker guarantee than it looks. Measured at $d=64$, $k=729$,
+lr $0.1$ under the constraints described below, held-out AUC rises monotonically
+with depth ($0.967 \to 0.974 \to 0.980 \to 0.980$ for $L = 0, 1, 2, 4$) while
+agreement with the ground-truth types falls by roughly half over the same range
+(Hungarian $11440 \to 6177 \to 6028 \to 4548$, NMI $0.53 \to 0.40 \to 0.42 \to
+0.38$), and the decoder bias is driven from $-6.7$ to $-20$ to make room for the
+residual. Multi-hop mixing of $\alpha U$ evidently recovers enough
+neighbourhood-specific signal to predict edges without the assignments having to
+carry type identity. Selection on held-out likelihood therefore prefers the
+deepest arm and the worst clustering; the ``gt_*`` diagnostics are the only
+warning of it.
 
 Minibatches are square induced subgraphs drawn by
 [`subgraph_sampler.SubgraphBatchSampler`](subgraph_sampler.py), matching the LV
@@ -43,11 +52,42 @@ at both that checkpoint (``gt_*``) and the final epoch (``last_gt_*``) as a
 diagnostic that never feeds selection. ``--label-smoothing`` is offered here for
 parity with those trainers: it caps the optimal Bernoulli logit at a finite
 value, applies to the **training loss only**, and is inert under the count
-likelihoods. So is ``--u-norm unit``, which normalises the low-rank prototypes
-``u_src`` / ``u_tgt`` in the forward pass and bounds the *bilinear* part of
-``eta_ij`` by the scale; the residual GNN term ``gamma * (h_i · h_j)`` is left
-free, so here the bound is partial. ``--u-norm none`` (the default) is the
-historical decoder.
+likelihoods.
+
+What ``--u-norm unit`` does and does not bound
+----------------------------------------------
+The block logit splits as ``eta = eta_LV + eta_GNN`` (see ``block_terms``), and
+the constraint reaches exactly one of the two halves:
+
+``eta_LV = (alpha_i U_s)·(alpha_j U_t) + b``
+    Bounded. ``u_src`` and ``u_tgt`` are unit-normalised row-wise in the forward
+    pass and the left factor is multiplied by the scale ``s``. Since ``alpha_i``
+    lies in the simplex, ``||alpha_i U_s|| <= s`` and ``||alpha_j U_t|| <= 1``, so
+    ``|eta_LV - b| <= s`` holds structurally, at every one of the three places
+    the decoder is evaluated: the subgraph-local block, the full-propagation
+    block, and the held-out pair path.
+``eta_GNN = gamma * (h_i · h_j)``
+    Not bounded by ``--u-norm``. Neither ``gamma``, the JK projection, nor the
+    source/target heads are constrained, so this term can grow without limit even
+    under ``--u-norm unit`` — and measurably does: at $L=2$, $d=64$,
+    $\\mathrm{lr}=0.01$, $\\max|\\eta^{GNN}|$ climbs from $7$ to $106$ within four
+    epochs while $\\max|\\eta^{LV}|$ never leaves $[6, 11]$, and it is the residual
+    that carries the run away. ``--gnn-norm unit`` normalises the two head outputs
+    to unit rows in the forward pass, which turns the residual into a cosine
+    similarity and makes ``gamma`` its entire magnitude budget:
+    $|\\eta^{GNN}| \\le |\\gamma|$.
+
+The per-epoch log reports ``max_abs_lv`` and ``max_abs_residual`` alongside
+``max_abs_logit``, so which half is growing is never a matter of inference.
+
+Note that a small ``gamma`` is *not* evidence that the residual is inactive. The
+term is a product, and with the heads unconstrained the optimiser is free to
+satisfy the data by growing $\\lVert h\\rVert$ instead of ``gamma``: the run above
+reaches $|\\eta^{GNN}| = 106$ at $\\gamma = -0.003$. Only under ``--gnn-norm unit``
+does ``gamma`` measure what the GNN actually contributes.
+
+``--u-norm none --gnn-norm none`` (the defaults) is the historical decoder, bit
+for bit.
 """
 
 from __future__ import annotations
@@ -98,6 +138,7 @@ from training_utils import (
     scaled_block_embeddings,
     smooth_binary_targets,
     u_norm_line,
+    unit_rows,
 )
 
 
@@ -121,6 +162,17 @@ HOP_BALL_NOTE = (
     "L=1 ~18, L=2 ~3k, L=3 ~37k, L=4 ~105k nodes."
 )
 PROPAGATIONS = ("subgraph", "full")
+GNN_NORMS = ("none", "unit")
+
+
+def gnn_norm_line(gnn_norm: str, gamma_init: float) -> str:
+    """One-line description of the residual constraint, for the run header."""
+    if gnn_norm == "none":
+        return "gnn_norm=none (residual gamma*(h_i.h_j) unbounded; |gamma| does not bound it)"
+    return (
+        f"gnn_norm=unit (residual is a cosine similarity) => |eta_GNN| <= |gamma|, "
+        f"{abs(gamma_init):.4f} at init"
+    )
 
 
 def pick_device(requested: str | None = None) -> str:
@@ -269,8 +321,12 @@ class GNNvSBM(nn.Module):
         u_norm: str = "none",
         u_scale: str = "fixed",
         u_scale_init: float = 1.0,
+        gnn_norm: str = "none",
     ):
         super().__init__()
+        if gnn_norm not in GNN_NORMS:
+            raise ValueError(f"unknown gnn-norm {gnn_norm!r}; expected one of {GNN_NORMS}")
+        self.gnn_norm = gnn_norm
         self.n = n
         self.k = k
         self.d = d
@@ -296,6 +352,22 @@ class GNNvSBM(nn.Module):
         self.block_scale = make_block_scale(u_norm, u_scale, u_scale_init, k, dtype, "cpu")
         if self.block_scale is not None and self.block_scale.log_scale is not None:
             self.u_log_scale = self.block_scale.log_scale
+
+    def _apply(self, *args, **kwargs):
+        """Keep the ``BlockScale`` pointing at the parameter the optimizer holds.
+
+        ``nn.Module.to`` only mutates a parameter in place when the conversion is
+        shallow-copy compatible; any change of device installs a *new* ``Parameter``
+        in ``_parameters`` instead. ``BlockScale`` keeps its own reference, so
+        without this rebind the forward pass would read a stale CPU tensor while
+        ``named_parameters`` (hence the optimizer and the checkpoint) tracked the
+        device copy, and the learned scale would never move. Silent on CPU,
+        fatal on an accelerator, which is exactly the wrong way round.
+        """
+        module = super()._apply(*args, **kwargs)
+        if module.block_scale is not None and module.block_scale.log_scale is not None:
+            module.block_scale.log_scale = module.u_log_scale
+        return module
 
     def prototypes(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Low-rank prototypes as they enter the decoder, normalised if requested."""
@@ -344,31 +416,44 @@ class GNNvSBM(nn.Module):
         h_src, h_tgt = self.propagate(alpha @ self.u, a_out_sub, a_in_sub)
         return alpha, h_src, h_tgt
 
-    def block_eta(
+    def block_terms(
         self,
-        alpha: torch.Tensor,
-        h_src: torch.Tensor,
-        h_tgt: torch.Tensor,
-    ) -> torch.Tensor:
-        """Dense $|S|\\times|S|$ predictor from block-local assignments/embeddings."""
-        u_src, u_tgt = self.prototypes()
-        lv = (alpha @ u_src) @ (alpha @ u_tgt).T
-        return lv + self.bias + self.gamma * (h_src @ h_tgt.T)
+        alpha_i: torch.Tensor,
+        alpha_j: torch.Tensor,
+        g_src: torch.Tensor,
+        g_tgt: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The two halves of the dense block logit, $\\eta = \\eta^{LV} + \\eta^{GNN}$.
 
-    def edge_logits(
-        self,
-        h_src: torch.Tensor,
-        h_tgt: torch.Tensor,
-        idx_i: torch.Tensor,
-        idx_j: torch.Tensor,
-    ) -> torch.Tensor:
-        """Dense block predictor from full-graph embeddings (``--propagation full``)."""
-        alpha_i = self.soft_assignments(idx_i)
-        alpha_j = self.soft_assignments(idx_j)
+        Returned separately because only the first is constrained: under
+        ``--u-norm unit`` the prototypes are unit rows times $s$, so
+        $|\\eta^{LV} - b| \\le s$, whereas $\\eta^{GNN} = \\gamma\\,h_i^\\top h_j$
+        involves no normalised tensor and is bounded by nothing. Which of the two
+        is growing is therefore the diagnostic that decides whether the constraint
+        can be expected to help at all.
+
+        Callers pass block-local embeddings under ``--propagation subgraph`` and
+        rows of the full-graph embeddings under ``--propagation full``; the
+        arithmetic is identical either way.
+        """
         u_src, u_tgt = self.prototypes()
         lv = (alpha_i @ u_src) @ (alpha_j @ u_tgt).T
-        gnn = h_src[idx_i] @ h_tgt[idx_j].T
-        return lv + self.bias + self.gamma * gnn
+        g_src, g_tgt = self.residual_embeddings(g_src, g_tgt)
+        return lv + self.bias, self.gamma * (g_src @ g_tgt.T)
+
+    def residual_embeddings(
+        self, g_src: torch.Tensor, g_tgt: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Head outputs as they enter the residual, normalised under ``--gnn-norm unit``.
+
+        Normalising here rather than at the heads keeps ``--gnn-norm none`` an
+        exact identity, and puts the constraint on the tensors that actually meet
+        in the inner product: with unit rows $|h_i^\\top h_j| \\le 1$, so
+        $|\\eta^{GNN}| \\le |\\gamma|$ at every call site.
+        """
+        if self.gnn_norm == "none":
+            return g_src, g_tgt
+        return unit_rows(g_src), unit_rows(g_tgt)
 
     def pair_logits(
         self,
@@ -382,7 +467,8 @@ class GNNvSBM(nn.Module):
         alpha_t = self.soft_assignments(tgt)
         u_src, u_tgt = self.prototypes()
         lv = ((alpha_s @ u_src) * (alpha_t @ u_tgt)).sum(dim=-1)
-        gnn = (h_src[src] * h_tgt[tgt]).sum(dim=-1)
+        g_src, g_tgt = self.residual_embeddings(h_src[src], h_tgt[tgt])
+        gnn = (g_src * g_tgt).sum(dim=-1)
         return lv + self.bias + self.gamma * gnn
 
 
@@ -453,8 +539,10 @@ def train(args: argparse.Namespace) -> dict:
         u_norm=args.u_norm,
         u_scale=args.u_scale,
         u_scale_init=args.u_scale_init,
+        gnn_norm=args.gnn_norm,
     ).to(device=device, dtype=dtype)
     print(u_norm_line(args.u_norm, model.block_scale, edge_bias_init))
+    print(gnn_norm_line(args.gnn_norm, args.gamma_init))
 
     params = [p for name, p in model.named_parameters() if name != "log_r"]
     if args.likelihood == "nb":
@@ -475,6 +563,8 @@ def train(args: argparse.Namespace) -> dict:
     n_skipped = 0
     last_epoch = -1
     max_abs_eta = 0.0
+    max_abs_lv = 0.0
+    max_abs_res = 0.0
     # A coverage-defined epoch is longer at higher bfs_frac, so an update budget is
     # what makes compute comparable across bfs_frac.
     epochs = args.epochs if args.target_updates is None else 10**9
@@ -488,6 +578,8 @@ def train(args: argparse.Namespace) -> dict:
             n_batches = 0
             epoch_pos_obs = 0
             epoch_max_abs_eta = 0.0
+            epoch_max_abs_lv = 0.0
+            epoch_max_abs_res = 0.0
             block_edges = 0
             block_nodes = 0
 
@@ -524,7 +616,7 @@ def train(args: argparse.Namespace) -> dict:
                         row_normalize_dense(prop_block),
                         row_normalize_dense(prop_block.T),
                     )
-                    eta = model.block_eta(alpha, h_src, h_tgt)
+                    lv_eta, res_eta = model.block_terms(alpha, alpha, h_src, h_tgt)
                 else:
                     if args.no_edge_mask or args.layers == 0:
                         a_out, a_in = a_out_full, a_in_full
@@ -538,9 +630,24 @@ def train(args: argparse.Namespace) -> dict:
                         )
                     h_src, h_tgt = model.encode_full(a_out, a_in)
                     alpha = model.soft_assignments(idx_t)
-                    eta = model.edge_logits(h_src, h_tgt, idx_t, idx_t)
+                    # The two sides are softmaxed independently, as the historical
+                    # full-propagation decoder did. Sharing a single node here is
+                    # algebraically identical but accumulates the gradient into
+                    # q_logits in a different order, which moves the run in its
+                    # last significant digits and so is not a no-op.
+                    lv_eta, res_eta = model.block_terms(
+                        model.soft_assignments(idx_t),
+                        model.soft_assignments(idx_t),
+                        h_src[idx_t],
+                        h_tgt[idx_t],
+                    )
 
+                eta = lv_eta + res_eta
                 epoch_max_abs_eta = max(epoch_max_abs_eta, float(eta.detach().abs().max().item()))
+                epoch_max_abs_lv = max(epoch_max_abs_lv, float(lv_eta.detach().abs().max().item()))
+                epoch_max_abs_res = max(
+                    epoch_max_abs_res, float(res_eta.detach().abs().max().item())
+                )
                 # Training targets only; the held-out labels are never smoothed.
                 target = smooth_binary_targets(
                     block, label_smoothing, base_rate, args.label_smoothing_target
@@ -560,6 +667,8 @@ def train(args: argparse.Namespace) -> dict:
             mean_loss = loss_sum / max(n_scored, 1)
             cum_pos_obs += epoch_pos_obs
             max_abs_eta = max(max_abs_eta, epoch_max_abs_eta)
+            max_abs_lv = max(max_abs_lv, epoch_max_abs_lv)
+            max_abs_res = max(max_abs_res, epoch_max_abs_res)
             last_epoch = epoch
             print(sampler.coverage_line(epoch, n_batches, epoch_pos_obs, cum_pos_obs, nnz))
             block_deg = block_edges / max(block_nodes, 1)
@@ -583,6 +692,7 @@ def train(args: argparse.Namespace) -> dict:
                 f"loss={mean_loss:.4f} val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
                 f"best_val_ll={checkpoint.metric:.6f}@{checkpoint.epoch} gamma={gamma:.6f} "
                 f"clusters={n_used}/{args.k} max_abs_logit={epoch_max_abs_eta:.3f} "
+                f"max_abs_lv={epoch_max_abs_lv:.3f} max_abs_residual={epoch_max_abs_res:.3f} "
                 f"updates={total_updates} skipped={n_skipped}"
             )
     except KeyboardInterrupt:
@@ -606,6 +716,8 @@ def train(args: argparse.Namespace) -> dict:
         label_smoothing,
         base_rate,
         max_abs_eta,
+        max_abs_lv,
+        max_abs_res,
         checkpoint,
         state,
         last_epoch,
@@ -674,6 +786,8 @@ def save_results(
     label_smoothing: float,
     base_rate: float,
     max_abs_eta: float,
+    max_abs_lv: float,
+    max_abs_res: float,
     checkpoint: BestCheckpoint,
     state: dict[str, torch.Tensor],
     last_epoch: int,
@@ -753,12 +867,15 @@ def save_results(
         "u_norm": args.u_norm,
         "u_scale": args.u_scale,
         "u_scale_init": args.u_scale_init,
+        "gnn_norm": args.gnn_norm,
         **block_scale_metrics(model.block_scale),
         **last_scale,
         "decoder_bias": float(model.bias.item()),
         "last_decoder_bias": last_bias,
         "train_base_rate": base_rate,
         "max_abs_train_logit": max_abs_eta,
+        "max_abs_train_lv_logit": max_abs_lv,
+        "max_abs_train_residual": max_abs_res,
         "edges_seen_x_nnz": cum_pos_obs / max(nnz, 1),
         "total_updates": total_updates,
         "skipped_updates": n_skipped,
@@ -847,6 +964,17 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     add_u_norm_arguments(p)
+    p.add_argument(
+        "--gnn-norm",
+        choices=GNN_NORMS,
+        default="none",
+        help=(
+            "Constraint on the GNN head outputs entering the residual term. "
+            "'none' (default) leaves them unconstrained, reproducing every run "
+            "made so far; 'unit' normalises each row in the forward pass, which "
+            "makes the residual a cosine similarity and bounds |eta_GNN| by |gamma|"
+        ),
+    )
     p.add_argument(
         "--gt",
         default="root_id_type_dict.pkl",
