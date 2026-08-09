@@ -123,6 +123,7 @@ from heldout import (
 from index_mapping import load_mapping
 from subgraph_sampler import SubgraphBatchSampler
 from training_utils import (
+    GNN_NORMS,
     LABEL_SMOOTHING_TARGETS,
     BestCheckpoint,
     add_u_norm_arguments,
@@ -162,7 +163,6 @@ HOP_BALL_NOTE = (
     "L=1 ~18, L=2 ~3k, L=3 ~37k, L=4 ~105k nodes."
 )
 PROPAGATIONS = ("subgraph", "full")
-GNN_NORMS = ("none", "unit")
 
 
 def gnn_norm_line(gnn_norm: str, gamma_init: float) -> str:

@@ -29,6 +29,7 @@ from evaluate_clustering import evaluate_pair, load_assignment_dict, load_ground
 from heldout import LIKELIHOODS, make_heldout_pairs, make_heldout_rows, save_heldout
 from training_utils import (
     DEFAULT_U_SCALE_INIT,
+    GNN_NORMS,
     LABEL_SMOOTHING_TARGETS,
     U_NORMS,
     U_SCALES,
@@ -42,6 +43,13 @@ class RunSpec:
     command: list[str]
     prefix: str
     hyperparams: dict
+    # Rows sharing a group are aggregated into one entry of ``final_summary``.
+    # Defaults to the method; a GNN depth comparison splits one method into
+    # several groups so each depth gets its own multi-seed mean and spread.
+    group: str = ""
+
+    def summary_group(self) -> str:
+        return self.group or self.method
 
 
 def smoothing_tag(eps: float) -> str:
@@ -107,6 +115,26 @@ def u_norm_of(hp: dict) -> UNorm:
         str(hp.get("u_scale", "fixed")),
         float(hp.get("u_scale_init", DEFAULT_U_SCALE_INIT)),
     )
+
+
+# ``--u-norm`` bounds the bilinear half of the GNN block logit; ``--gnn-norm``
+# bounds the residual half, which is the half measured to diverge. The two are
+# swept independently, so the residual constraint needs its own run-name tag.
+def gnn_norm_tag(gnn_norm: str) -> str:
+    """Run-name suffix, empty for the unconstrained residual.
+
+    As with ``u_norm_tag``, the default arm keeps the prefixes every existing
+    artefact was written under, so ``--skip-existing`` stays valid.
+    """
+    return "" if gnn_norm == "none" else f"_gnn{gnn_norm}"
+
+
+def gnn_norm_flags(gnn_norm: str) -> list[str]:
+    return ["--gnn-norm", gnn_norm]
+
+
+def gnn_norm_of(hp: dict) -> str:
+    return str(hp.get("gnn_norm", "none"))
 
 
 def run_cmd(cmd: list[str]) -> None:
@@ -391,11 +419,12 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
             args.gnn_likelihoods,
             args.gnn_label_smoothings,
             u_norm_settings(args.gnn_u_norms, args.gnn_u_scales, args.gnn_u_scale_inits),
+            args.gnn_norms,
         )
-        for layers, d, lr, bfs_frac, likelihood, eps, u_setting in gnn_grid:
+        for layers, d, lr, bfs_frac, likelihood, eps, u_setting, gnn_norm in gnn_grid:
             name = (
                 f"hp_gnn_L{layers}_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}"
-                f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}"
+                f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}{gnn_norm_tag(gnn_norm)}"
             )
             specs.append(
                 RunSpec(
@@ -410,6 +439,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         "likelihood": likelihood,
                         "label_smoothing": eps,
                         **u_norm_hyperparams(u_setting),
+                        "gnn_norm": gnn_norm,
                     },
                     command=[
                         py,
@@ -434,6 +464,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         str(args.grad_clip),
                         *smoothing_flags(eps, args.label_smoothing_target),
                         *u_norm_flags(u_setting),
+                        *gnn_norm_flags(gnn_norm),
                         "--epochs",
                         str(args.epochs),
                         "--minibatch",
@@ -540,11 +571,39 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
     return specs
 
 
+def gnn_final_variants(args: argparse.Namespace, hp: dict) -> list[dict]:
+    """Selected GNN configuration, plus the same configuration at other depths.
+
+    Held-out likelihood is known to prefer the deepest arm while ground truth
+    prefers the shallowest, so running the multi-seed finals only at the selected
+    depth would leave the size of that disagreement resting on the single-seed HP
+    rows. ``--gnn-final-layers`` retrains the comparison depths under the
+    identical protocol, which is the only way to say whether the gap survives
+    seed noise.
+    """
+    depths = [int(hp["layers"]), *(int(x) for x in args.gnn_final_layers)]
+    return [{**hp, "layers": depth} for depth in dict.fromkeys(depths)]
+
+
+def final_variants(args: argparse.Namespace, method: str, hp: dict) -> list[tuple[str, dict]]:
+    """``(summary group, hyperparameters)`` for each final arm of one method."""
+    if method != "gnn":
+        return [(method, hp)]
+    variants = gnn_final_variants(args, hp)
+    if len(variants) == 1:
+        return [(method, variants[0])]
+    return [(f"{method}_L{v['layers']}", v) for v in variants]
+
+
 def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> list[RunSpec]:
     py = sys.executable
     specs: list[RunSpec] = []
-    for method, best in best_by_method.items():
-        hp = best["hyperparams"]
+    variants = [
+        (method, group, hp)
+        for method, best in best_by_method.items()
+        for group, hp in final_variants(args, method, best["hyperparams"])
+    ]
+    for method, group, hp in variants:
         for seed in args.final_seeds:
             if method == "pca":
                 name = f"final_pca_d{hp['d']}_lr{hp['lr']}_seed{seed}"
@@ -693,10 +752,12 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
             elif method == "gnn":
                 eps = float(hp.get("label_smoothing", 0.0))
                 u_setting = u_norm_of(hp)
+                gnn_norm = gnn_norm_of(hp)
                 name = (
                     f"final_gnn_L{hp['layers']}_d{hp['d']}_lr{hp['lr']}_"
                     f"bfs{hp['bfs_frac']}_{hp['likelihood']}"
-                    f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}_seed{seed}"
+                    f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}{gnn_norm_tag(gnn_norm)}"
+                    f"_seed{seed}"
                 )
                 cmd = [
                     py,
@@ -721,6 +782,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     str(args.grad_clip),
                     *smoothing_flags(eps, args.label_smoothing_target),
                     *u_norm_flags(u_setting),
+                    *gnn_norm_flags(gnn_norm),
                     "--epochs",
                     str(args.final_epochs),
                     "--minibatch",
@@ -764,6 +826,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     prefix=name,
                     hyperparams={**hp, "seed": seed},
                     command=cmd,
+                    group=group,
                 )
             )
     return specs
@@ -960,6 +1023,30 @@ def main() -> None:
         "--gnn-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson", "nb"]
     )
     p.add_argument(
+        "--gnn-norms",
+        nargs="+",
+        choices=GNN_NORMS,
+        default=["none"],
+        help=(
+            "GNN residual constraint grid. 'none' (default) leaves "
+            "gamma * (h_i . h_j) unbounded -- the half of the block logit that "
+            "--gnn-u-norms does not reach and the half measured to diverge; "
+            "'unit' makes the residual a cosine similarity, so |eta_GNN| <= |gamma|"
+        ),
+    )
+    p.add_argument(
+        "--gnn-final-layers",
+        type=int,
+        nargs="*",
+        default=[],
+        help=(
+            "Extra GNN depths to retrain in the multi-seed finals alongside the "
+            "selected one, holding every other selected hyperparameter fixed. "
+            "Each depth is summarised separately, which is what turns the "
+            "depth-versus-ground-truth comparison into a multi-seed statement"
+        ),
+    )
+    p.add_argument(
         "--gnn-propagation",
         choices=["subgraph", "full"],
         default="subgraph",
@@ -1034,6 +1121,7 @@ def main() -> None:
             if method == "gnn":
                 hp["layers"] = int(best["layers"])
                 hp["propagation"] = args.gnn_propagation
+                hp["gnn_norm"] = gnn_norm_of(best)
             if method in {"lv", "lv_e", "gnn"}:
                 hp["bfs_frac"] = float(best["bfs_frac"])
                 hp["likelihood"] = str(best["likelihood"])
@@ -1090,6 +1178,7 @@ def main() -> None:
                 "phase": "final",
                 "name": spec.name,
                 "method": spec.method,
+                "group": spec.summary_group(),
                 **spec.hyperparams,
                 "val_metric": metrics["val_metric"],
                 "val_native_ll": metrics.get("val_native_ll"),
@@ -1110,14 +1199,24 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(final_rows)
 
-        # Uncertainty summary
+        # Uncertainty summary, one entry per group. A group is a method unless
+        # extra GNN depths were retrained, in which case each depth is summarised
+        # on its own and only one of them is the arm validation actually chose.
         summary = []
-        for method in sorted({r["method"] for r in final_rows}):
-            sub = [r for r in final_rows if r["method"] == method]
+        variant_hp = {
+            group: hp
+            for method, best in best_by_method.items()
+            for group, hp in final_variants(args, method, best["hyperparams"])
+        }
+        for group in sorted({r.get("group", r["method"]) for r in final_rows}):
+            sub = [r for r in final_rows if r.get("group", r["method"]) == group]
+            method = sub[0]["method"]
+            selected = variant_hp.get(group) == best_by_method[method]["hyperparams"]
             hun = np.array([r["gt_hungarian"] for r in sub], dtype=float)
             ari = np.array([r["gt_ari"] for r in sub], dtype=float)
             nmi = np.array([r["gt_nmi"] for r in sub], dtype=float)
             entry = {
+                "group": group,
                 "method": method,
                 "n_seeds": len(sub),
                 "hungarian_mean": float(hun.mean()),
@@ -1126,8 +1225,11 @@ def main() -> None:
                 "ari_std": float(ari.std(ddof=1)) if len(sub) > 1 else 0.0,
                 "nmi_mean": float(nmi.mean()),
                 "nmi_std": float(nmi.std(ddof=1)) if len(sub) > 1 else 0.0,
-                "best_hyperparams": best_by_method[method]["hyperparams"],
-                "selection_val_metric": best_by_method[method]["val_metric"],
+                "best_hyperparams": variant_hp.get(group, best_by_method[method]["hyperparams"]),
+                "selected_by_val": selected,
+                # Only meaningful for the arm the HP search selected; a comparison
+                # depth was never in the running for this number.
+                "selection_val_metric": best_by_method[method]["val_metric"] if selected else None,
             }
             # Same seeds, same budget: the controlled answer to whether restoring the
             # best-validation checkpoint costs or buys ground-truth agreement.
@@ -1139,8 +1241,9 @@ def main() -> None:
                 entry["hungarian_best_minus_last"] = entry["hungarian_mean"] - float(arr.mean())
             summary.append(entry)
             print(
-                f"SUMMARY {method}: Hungarian "
+                f"SUMMARY {group}: Hungarian "
                 f"{summary[-1]['hungarian_mean']:.1f} ± {summary[-1]['hungarian_std']:.1f}"
+                f"{'' if selected else ' (comparison arm, not selected)'}"
             )
         Path("final_summary.json").write_text(json.dumps(summary, indent=2))
         with Path("final_summary.csv").open("w", newline="") as f:

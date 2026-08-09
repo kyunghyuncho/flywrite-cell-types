@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+import tarfile
 import time
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from lightning_sdk import Machine, Studio
 from heldout import LIKELIHOODS
 from training_utils import (
     DEFAULT_U_SCALE_INIT,
+    GNN_NORMS,
     LABEL_SMOOTHING_TARGETS,
     U_NORMS,
     U_SCALES,
@@ -94,6 +96,45 @@ def resolve_machine(name: str) -> Machine:
 def studio_run(studio: Studio, cmd: str) -> tuple[str, int]:
     out, code = studio.run_with_exit_code(cmd)
     return out or "", int(code)
+
+
+REMOTE_BUNDLE = "sweep_tables.tar.gz"
+
+
+def download_tables(studio: Studio, dest: Path) -> None:
+    """Fetch the tables, per-run metrics and log as one small archive.
+
+    Deliberately excludes the ``*.npy`` assignment dicts and score matrices. A
+    98 MB archive containing them failed to download while a 1.1 MB JSON/CSV/log
+    archive succeeded first time, and everything needed to merge and interpret a
+    sweep is in the small payload: the tables already carry the ground-truth
+    scores that ``run_experiments.py`` computed from those arrays.
+
+    Writing into ``dest`` rather than the repository root is what keeps the
+    accumulated canonical tables intact until ``merge_sweep_results.py`` runs.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    build = (
+        "cd /teamspace/studios/this_studio && "
+        f"rm -f {REMOTE_BUNDLE} && "
+        f"tar czf {REMOTE_BUNDLE} "
+        "$(ls -1 hp_*_metrics.json final_*_metrics.json hp_results.json hp_results.csv "
+        "hp_best.json final_results.json final_results.csv final_summary.json "
+        f"final_summary.csv {REMOTE_LOG} 2>/dev/null) && "
+        f"ls -l {REMOTE_BUNDLE}"
+    )
+    out, code = studio_run(studio, build)
+    print(out)
+    if code != 0:
+        raise RuntimeError(f"Failed to build {REMOTE_BUNDLE} on the Studio")
+
+    local_bundle = dest / REMOTE_BUNDLE
+    studio.download_file(REMOTE_BUNDLE, str(local_bundle))
+    with tarfile.open(local_bundle) as tar:
+        tar.extractall(dest, filter="data")
+    local_bundle.unlink()
+    files = sorted(p.name for p in dest.iterdir())
+    print(f"Extracted {len(files)} file(s) into {dest}")
 
 
 def download_artifacts(studio: Studio) -> None:
@@ -202,6 +243,23 @@ def main() -> None:
     parser.add_argument(
         "--gnn-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson", "nb"]
     )
+    parser.add_argument(
+        "--gnn-norms",
+        nargs="+",
+        choices=GNN_NORMS,
+        default=["none"],
+        help=(
+            "GNN residual constraint grid; 'unit' bounds gamma*(h_i.h_j), the half "
+            "of the block logit that --gnn-u-norms leaves free"
+        ),
+    )
+    parser.add_argument(
+        "--gnn-final-layers",
+        type=int,
+        nargs="*",
+        default=[],
+        help="Extra GNN depths to retrain in the multi-seed finals beside the selected one",
+    )
     parser.add_argument("--gnn-propagation", choices=["subgraph", "full"], default="subgraph")
     parser.add_argument("--gnn-e-layers", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--gnn-e-dims", type=int, nargs="+", default=[32, 64])
@@ -249,6 +307,15 @@ def main() -> None:
         action="store_true",
         help="Start the remote job and exit without polling/downloading.",
     )
+    parser.add_argument(
+        "--download-only",
+        metavar="DIR",
+        help=(
+            "Skip upload and launch: fetch the current tables, per-run metrics "
+            "and log from the Studio into DIR, then exit. Merge them with "
+            "merge_sweep_results.py; nothing in the repository root is touched."
+        ),
+    )
     args = parser.parse_args()
     require_auth()
 
@@ -270,6 +337,15 @@ def main() -> None:
             raise SystemExit("Could not disable auto-sleep; refusing to start a long sweep")
     studio.start(machine)
     print(f"Studio ready on {studio.machine} (auto_sleep={studio.auto_sleep})")
+
+    if args.download_only:
+        try:
+            download_tables(studio, Path(args.download_only))
+        finally:
+            if args.stop_after:
+                print("Stopping Studio...")
+                studio.stop()
+        return
 
     try:
         if not args.skip_upload:
@@ -331,6 +407,7 @@ def main() -> None:
             f"--gnn-lrs {join_nums(args.gnn_lrs)} "
             f"--gnn-bfs-fracs {join_nums(args.gnn_bfs_fracs)} "
             f"--gnn-likelihoods {join_nums(args.gnn_likelihoods)} "
+            f"--gnn-norms {join_nums(args.gnn_norms)} "
             f"--gnn-propagation {args.gnn_propagation} "
             f"--gnn-e-layers {join_nums(args.gnn_e_layers)} "
             f"--gnn-e-dims {join_nums(args.gnn_e_dims)} "
@@ -342,6 +419,8 @@ def main() -> None:
             f"--ntac-frac-seeds {join_nums(args.ntac_frac_seeds)} "
             f"--final-seeds {join_nums(args.final_seeds)}"
         )
+        if args.gnn_final_layers:
+            sweep_args += f" --gnn-final-layers {join_nums(args.gnn_final_layers)}"
         if args.skip_existing:
             sweep_args += " --skip-existing"
 
