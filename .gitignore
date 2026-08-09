@@ -26,6 +26,8 @@ ntac_hp_results.json
 # (gnn_sweep2_results/, gnn_sweep_results_20260809/), which a literal
 # "_sweep_results/" misses.
 *sweep*results*/
+# Entropy-β ablation outputs (STATUS.txt, poller logs, per-run metrics); not source.
+entropy_beta_results/
 heldout_pairs.npz
 heldout_rows.npz
 *_metrics.json

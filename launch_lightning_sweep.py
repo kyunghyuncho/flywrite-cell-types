@@ -225,6 +225,13 @@ def main() -> None:
     parser.add_argument("--lv-u-scales", nargs="+", choices=U_SCALES, default=["fixed"])
     parser.add_argument("--lv-u-scale-inits", type=float, nargs="+", default=[DEFAULT_U_SCALE_INIT])
     parser.add_argument(
+        "--lv-entropy-betas",
+        type=float,
+        nargs="+",
+        default=[1.0],
+        help="LV entropy-weight grid on sum_i H(q_i); 1.0 is the uniform-prior ELBO",
+    )
+    parser.add_argument(
         "--label-smoothing-target",
         choices=LABEL_SMOOTHING_TARGETS,
         default="base_rate",
@@ -359,6 +366,7 @@ def main() -> None:
             f"--lv-u-norms {join_nums(args.lv_u_norms)} "
             f"--lv-u-scales {join_nums(args.lv_u_scales)} "
             f"--lv-u-scale-inits {join_nums(args.lv_u_scale_inits)} "
+            f"--lv-entropy-betas {join_nums(args.lv_entropy_betas)} "
             f"--lv-control-updates {args.lv_control_updates} "
             f"--ntac-max-ks {join_nums(args.ntac_max_ks)} "
             f"--ntac-max-iters {join_nums(args.ntac_max_iters)} "

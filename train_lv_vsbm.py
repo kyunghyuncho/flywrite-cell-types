@@ -31,6 +31,13 @@ the *iterate* instead of the optimum: the cluster embeddings are normalised in
 the forward pass and the block logit becomes $\\eta_{kk'} = s\\,\\hat u_k^\\top
 \\hat v_{k'} + b$, so $|\\eta_{kk'} - b| \\le s$ holds identically. ``--u-norm
 none`` (the default) leaves the decoder exactly as it was.
+
+The minibatch objective matches the blog ELBO on the induced subgraph: the
+expected complete log-likelihood (summed over kept pairs) plus
+``--entropy-beta`` times $\\sum_{i \\in \\mathrm{batch}} H(q_i)$. Earlier code
+added *mean* entropy, which underweighted the prior term by roughly the batch
+size; $\\beta_H=1$ is now the standard uniform-prior ELBO, and $\\beta_H \\ne 1$
+is the $\\beta$-VAE-style reweighting.
 """
 
 from __future__ import annotations
@@ -247,6 +254,10 @@ def train(args: argparse.Namespace) -> dict:
         f"bfs_frac={args.bfs_frac} bfs_seeds={args.bfs_seeds}"
     )
     print(label_smoothing_line(label_smoothing, base_rate, args.label_smoothing_target))
+    print(
+        f"entropy_beta={args.entropy_beta:g} "
+        f"(ELBO uses sum_i H(q_i) over the minibatch; beta=1 is the uniform-prior bound)"
+    )
 
     held = load_heldout(Path(args.heldout_pairs))
     held_src_np = held["src"]
@@ -307,6 +318,8 @@ def train(args: argparse.Namespace) -> dict:
             if args.target_updates is not None and total_updates >= args.target_updates:
                 break
             loss_sum = 0.0
+            ll_sum = 0.0
+            entropy_sum_acc = 0.0
             n_scored = 0
             n_batches = 0
             epoch_pos_obs = 0
@@ -341,9 +354,13 @@ def train(args: argparse.Namespace) -> dict:
                 target = smooth_binary_targets(
                     block, label_smoothing, base_rate, args.label_smoothing_target
                 )
-                obj = expected_block_ll(args.likelihood, q, target, keep, eta, log_r)
-                obj = obj - (q * log_clamp(q)).sum(1).mean()
+                ll_term = expected_block_ll(args.likelihood, q, target, keep, eta, log_r)
+                # H(q_i) = -sum_k q_ik log q_ik; sum over the minibatch nodes.
+                entropy_sum = -(q * log_clamp(q)).sum()
+                obj = ll_term + args.entropy_beta * entropy_sum
                 # Normalize roughly by #kept pairs so loss scale is stable.
+                # LL and entropy share the factor, so their relative weight (and
+                # --entropy-beta) is unchanged.
                 obj = obj * (idx.size * idx.size) / n_keep.clamp(min=1)
                 loss = -obj
 
@@ -351,9 +368,13 @@ def train(args: argparse.Namespace) -> dict:
                     n_skipped += 1
                     continue
                 loss_sum += float(loss.item())
+                ll_sum += float(ll_term.detach().item())
+                entropy_sum_acc += float(entropy_sum.detach().item())
                 n_scored += 1
 
             mean_loss = loss_sum / max(n_scored, 1)
+            mean_ll_term = ll_sum / max(n_scored, 1)
+            mean_entropy_term = entropy_sum_acc / max(n_scored, 1)
             cum_pos_obs += epoch_pos_obs
             max_abs_eta = max(max_abs_eta, epoch_max_abs_eta)
             last_epoch = epoch
@@ -375,7 +396,10 @@ def train(args: argparse.Namespace) -> dict:
             n_used = int(torch.unique(torch.argmax(q_logits, dim=-1)).numel())
             print(decoder_line(epoch, float(bias.item()), scale))
             print(
-                f"loss={mean_loss:.4f} val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
+                f"loss={mean_loss:.4f} ll_term={mean_ll_term:.4f} "
+                f"entropy_sum={mean_entropy_term:.4f} "
+                f"entropy_beta={args.entropy_beta:g} "
+                f"val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
                 f"best_val_{args.select_metric}={checkpoint.metric:.6f}@{checkpoint.epoch} "
                 f"clusters={n_used}/{args.k} max_abs_logit={epoch_max_abs_eta:.3f} "
                 f"updates={total_updates} skipped={n_skipped}"
@@ -457,6 +481,7 @@ def train(args: argparse.Namespace) -> dict:
         "label_smoothing": args.label_smoothing,
         "label_smoothing_target": args.label_smoothing_target,
         "label_smoothing_applied": label_smoothing > 0.0,
+        "entropy_beta": args.entropy_beta,
         "u_norm": args.u_norm,
         "u_scale": args.u_scale,
         "u_scale_init": args.u_scale_init,
@@ -548,6 +573,16 @@ def build_argparser() -> argparse.ArgumentParser:
         help=(
             "Prior the targets are pulled towards: 'base_rate' preserves the edge "
             "marginal; 'uniform' (0.5) inflates negatives far above the true density"
+        ),
+    )
+    p.add_argument(
+        "--entropy-beta",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier on sum_i H(q_i) in the minibatch ELBO (default 1 = standard "
+            "uniform-prior bound). Values below 1 sharpen assignments; above 1 soften "
+            "them. Selection still uses the held-out metric, never this reweighted loss"
         ),
     )
     add_u_norm_arguments(p)
