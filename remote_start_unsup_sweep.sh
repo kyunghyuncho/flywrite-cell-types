@@ -8,6 +8,10 @@ LOG="${REMOTE_LOG:-unsup_sweep.log}"
 DONE="${REMOTE_DONE:-unsup_sweep.done}"
 PIDFILE="${REMOTE_PID:-unsup_sweep.pid}"
 REMOTE_STOP_AFTER="${REMOTE_STOP_AFTER:-0}"
+# Clearing hp_*/final_* keeps a fresh sweep from inheriting stale artefacts of a
+# different method. It is exactly wrong when resuming an interrupted sweep with
+# --skip-existing, which needs the completed runs to still be there.
+CLEAN_ARTIFACTS="${CLEAN_ARTIFACTS:-1}"
 
 WORK="$(
 python -c "
@@ -44,8 +48,14 @@ pkill -f 'train_lv_e.py' 2>/dev/null || true
 pkill -f 'gnn_vsbm.py' 2>/dev/null || true
 pkill -f 'gnn_e_vsbm.py' 2>/dev/null || true
 pkill -f 'train_ntac.py' 2>/dev/null || true
-rm -f "$DONE" "$LOG"
-rm -f hp_* final_* 2>/dev/null || true
+rm -f "$DONE"
+if [ "$CLEAN_ARTIFACTS" = "1" ]; then
+  rm -f "$LOG"
+  rm -f hp_* final_* 2>/dev/null || true
+else
+  echo "Keeping existing hp_*/final_* artefacts (CLEAN_ARTIFACTS=0)"
+  [ -f "$LOG" ] && mv "$LOG" "$LOG.$(date +%Y%m%d%H%M%S)"
+fi
 
 WRAPPER="$WORK/remote_run_unsup_sweep.sh"
 cat >"$WRAPPER" <<EOF
