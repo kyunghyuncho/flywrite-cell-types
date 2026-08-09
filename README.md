@@ -41,7 +41,9 @@ mattered, what did not, and which pieces of code embody each lesson.
 
 Together these take LV from Hungarian $\approx 2\,500$ (uniform minibatches,
 unconstrained decoder, LL selection) to $\approx 25\,100$ on the shared
-labelled neurons (multi-seed mean under AUC selection).
+labelled neurons (multi-seed mean under AUC selection), and restoring the
+sum-entropy ELBO with AUC-selected $\beta_H=0.3$ further lifts the headline to
+$\approx 26\,800$.
 
 ### What did not matter
 
@@ -52,7 +54,7 @@ labelled neurons (multi-seed mean under AUC selection).
 2. **Graph neural nets over soft assignments (or over $e_i$).** A multi-hop
    residual GNN, once stabilised, became a better edge model and a worse
    cell-type model. Its best stabilised single-seed arm reached Hungarian
-   $\approx 15\,700$ against LV's $\approx 25\,100$, and its held-out
+   $\approx 15\,700$ against LV's $\approx 25\,100$–$26\,800$, and its held-out
    likelihood was *negatively* correlated with ground truth. Selecting by the
    unsupervised objective therefore preferred its worst clusterings. The GNN
    and $e_i$ trainers have been removed from this branch so the teaching
@@ -75,7 +77,8 @@ $K=729$ assignment scores $\approx 980$.
 | method | Hungarian (mean $\pm$ std) | fraction of $46\,479$ | ARI | NMI | $K_{\mathrm{pred}}$ (labelled) | seeds |
 | --- | --- | --- | --- | --- | --- | --- |
 | Unseeded NTAC | $30\,654.5 \pm 24.7$ | $66.0\%$ | $0.676$ | $0.878$ | $\approx 226$–$260$ | $2$ |
-| **LV vSBM (BFS + unit-norm + AUC)** | $\mathbf{25\,095.3 \pm 911.6}$ | $\mathbf{54.0\%}$ | $0.522$ | $0.828$ | $\approx 383$–$481$ | $3$ |
+| **LV vSBM (BFS + unit-norm + AUC, $\beta_H=0.3$)** | $\mathbf{26\,837 \pm 339}$ | $\mathbf{57.7\%}$ | $0.609$ | $0.862$ | $\approx 401\pm42$ | $3$ |
+| LV vSBM (prior AUC width sweep) | $25\,095.3 \pm 911.6$ | $54.0\%$ | $0.522$ | $0.828$ | $\approx 383$–$481$ | $3$ |
 | LV, earlier unit-norm sweep ($d=256$, LL-selected) | $24\,300.0 \pm 971.6$ | $52.3\%$ | $0.488$ | $0.822$ | $\approx 388$–$484$ | $3$ |
 | LV, unconstrained decoder (same sampler) | $8\,459.7 \pm 354.1$ | $18.2\%$ | $0.177$ | $0.509$ | — | $3$ |
 | LV $+\,e_i$ (negative result; removed) | $5\,216.3 \pm 89.2$ | $11.2\%$ | $0.042$ | $0.373$ | — | $3$ |
@@ -83,14 +86,13 @@ $K=729$ assignment scores $\approx 980$.
 | PCA $+\,k$-means | $1\,355.0 \pm 88.8$ | $2.9\%$ | $0.008$ | $0.225$ | — | $3$ |
 | random $K=729$ assignment | $980.0 \pm 8.0$ | $2.1\%$ | $0.000$ | $0.202$ | $729$ (by construction) | $20$ |
 
-The headline LV configuration (AUC-selected width sweep) is
-`d=512, lr=0.03, bernoulli, bfs_frac=1.0, --u-norm unit --u-scale fixed
---u-scale-init 16, --select-metric auc`, $40$ epochs, seeds $0/1/2$; held-out
-AUC $0.980\pm0.001$. On the HP grid, the best single-seed Hungarian was
-$25\,769$ at `d=1024, lr=0.03, scale=12`, which AUC did not select — another
-reminder that the proxy and the scientific target can disagree within a strong
-regime. NTAC remains ahead and is coarser ($K_{\mathrm{pred}}$); Hungarian is
-not resolution-matched across rows. Closing the gap is open.
+The headline LV configuration is the restored sum-entropy ELBO with AUC-selected
+$\beta_H=0.3$ on `d=512, lr=0.03, bernoulli, bfs_frac=1.0, --u-norm unit
+--u-scale fixed --u-scale-init 16`, $40$ epochs, seeds $0/1/2$; held-out AUC
+$0.9859\pm0.0003$. That beats the prior LV bar ($\approx 25\,095$) while
+remaining below NTAC ($\approx 30\,654$), which is still coarser in
+$K_{\mathrm{pred}}$. Closing the gap is open; a free $K\times K$ block table
+is an optional next step.
 
 ## Data
 
@@ -155,10 +157,13 @@ Shared utilities live in [`training_utils.py`](training_utils.py) and
   now logs `ll_term` and `entropy_sum` separately. Sweep with
   `--lv-entropy-betas` in [`run_experiments.py`](run_experiments.py). Selection
   remains held-out AUC / LL, never the reweighted training objective.
+  `hp_best.json` must propagate `entropy_beta` into finals (otherwise retrains
+  silently default to $1.0$).
 
-### Deferred (until entropy $\beta_H$ is settled)
+### Deferred
 
-These stay out of the code on purpose:
+These stay out of the code on purpose (entropy $\beta_H$ is settled; free $B$
+remains an optional next experiment):
 
 1. **Adjacency smoothness on $q$.** Pulling neighbouring neurons toward similar
    posteriors is a homophily prior. FlyWire visual types are defined by partner
@@ -204,7 +209,14 @@ uv run python run_experiments.py \
 ```
 
 Entropy-weight ablation on the headline configuration
-(`d=512`, `lr=0.03`, unit-norm scale $16$):
+(`d=512`, `lr=0.03`, unit-norm scale $16$). Completed: restored sum-entropy
+ELBO; swept $\beta_H\in\{0,0.1,0.3,1,3\}$ with AUC selection. HP Hungarian by
+$\beta_H$: $0\to26\,092$, $0.1\to23\,638$, $0.3\to26\,568$, $1\to20\,569$,
+$3\to2\,845$ (note $\beta_H=1$ under the restored scale is worse than the old
+$\approx25\,k$ baseline, which had underweighted entropy). AUC selected
+$\beta_H=0.3$; three-seed finals: Hungarian $26\,837\pm339$, AUC
+$0.9859\pm0.0003$, $K_{\mathrm{pred}}$ $401\pm42$, ARI $0.609\pm0.027$, NMI
+$0.862\pm0.004$.
 
 ```bash
 uv run python run_experiments.py \
