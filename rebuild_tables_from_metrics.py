@@ -26,8 +26,8 @@ best of what was asked for. ``partial`` records that on every row.
 
 Usage::
 
-    uv run python rebuild_tables_from_metrics.py --source gnn_sweep2_results --method gnn
-    uv run python rebuild_tables_from_metrics.py --source <dir> --method gnn --dry-run
+    uv run python rebuild_tables_from_metrics.py --source <dir> --method lv
+    uv run python rebuild_tables_from_metrics.py --source <dir> --method lv --dry-run
 """
 
 from __future__ import annotations
@@ -38,15 +38,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from run_experiments import DIAGNOSTIC_KEYS, gnn_norm_of, u_norm_hyperparams, u_norm_of
+from run_experiments import DIAGNOSTIC_KEYS, u_norm_hyperparams, u_norm_of
 
 # Per method, the columns that identify a point in the sweep grid. These mirror
 # the ``hyperparams`` dicts assembled in ``run_experiments.hp_specs``.
 HYPERPARAM_KEYS: dict[str, tuple[str, ...]] = {
     "lv": ("d", "lr", "bfs_frac", "likelihood", "label_smoothing"),
-    "lv_e": ("d", "d_e", "lr", "e_wd", "bfs_frac", "likelihood", "label_smoothing"),
-    "gnn": ("layers", "d", "lr", "bfs_frac", "likelihood", "label_smoothing"),
-    "gnn_e": ("layers", "d", "d_e", "lr", "e_wd", "bfs_frac", "likelihood"),
+    "pca": ("d", "lr"),
+    "ntac": ("d", "max_k", "max_iterations", "frac_seeds"),
 }
 GT_KEYS = ("n_shared", "n_gt_clusters", "n_pred_clusters", "hungarian", "ari", "nmi")
 
@@ -54,10 +53,8 @@ GT_KEYS = ("n_shared", "n_gt_clusters", "n_pred_clusters", "hungarian", "ari", "
 def hp_of(method: str, metrics: dict) -> dict[str, Any]:
     """The grid coordinates of one run, as its tables would have recorded them."""
     hp = {k: metrics[k] for k in HYPERPARAM_KEYS.get(method, ()) if k in metrics}
-    if method in {"lv", "lv_e", "gnn"}:
+    if method == "lv":
         hp.update(u_norm_hyperparams(u_norm_of(metrics)))
-    if method == "gnn":
-        hp["gnn_norm"] = gnn_norm_of(metrics)
     return hp
 
 
@@ -82,21 +79,24 @@ def row_of(method: str, name: str, metrics: dict) -> dict[str, Any]:
     return row
 
 
-def best_hyperparams(method: str, best: dict, propagation: str) -> dict[str, Any]:
+def best_hyperparams(method: str, best: dict) -> dict[str, Any]:
     """Mirror the selected-hyperparameter record ``run_experiments`` would write."""
+    if method == "ntac":
+        return {
+            "d": int(best["d"]),
+            "lr": float(best.get("lr", 0.0)),
+            "max_k": int(best["max_k"]),
+            "max_iterations": int(best["max_iterations"]),
+            "frac_seeds": float(best["frac_seeds"]),
+        }
     hp: dict[str, Any] = {"d": int(best["d"]), "lr": float(best["lr"])}
-    if method == "gnn":
-        hp["layers"] = int(best["layers"])
-        hp["propagation"] = propagation
-        hp["gnn_norm"] = gnn_norm_of(best)
-    if method in {"lv", "lv_e", "gnn"}:
+    if method == "lv":
         hp["bfs_frac"] = float(best["bfs_frac"])
         hp["likelihood"] = str(best["likelihood"])
         hp["label_smoothing"] = float(best.get("label_smoothing", 0.0))
         hp.update(u_norm_hyperparams(u_norm_of(best)))
-    if method in {"lv_e", "gnn_e"}:
-        hp["d_e"] = int(best["d_e"])
-        hp["e_wd"] = float(best["e_wd"])
+        if best.get("target_updates"):
+            hp["target_updates"] = int(best["target_updates"])
     return hp
 
 
@@ -117,11 +117,11 @@ def write(path: Path, rows: list[dict[str, Any]], dry_run: bool) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", required=True, help="Directory of one sweep's *_metrics.json")
-    p.add_argument("--method", required=True, help="Method these runs belong to, e.g. gnn")
     p.add_argument(
-        "--propagation",
-        default="subgraph",
-        help="Propagation the GNN runs used; recorded in hp_best (default: subgraph)",
+        "--method",
+        required=True,
+        choices=["pca", "lv", "ntac"],
+        help="Method these runs belong to",
     )
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
@@ -152,7 +152,7 @@ def main() -> None:
         args.method: {
             "name": best["name"],
             "val_metric": best["val_metric"],
-            "hyperparams": best_hyperparams(args.method, best, args.propagation),
+            "hyperparams": best_hyperparams(args.method, best),
             "partial": True,
         }
     }

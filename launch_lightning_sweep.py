@@ -25,7 +25,6 @@ from lightning_sdk import Machine, Studio
 from heldout import LIKELIHOODS
 from training_utils import (
     DEFAULT_U_SCALE_INIT,
-    GNN_NORMS,
     LABEL_SMOOTHING_TARGETS,
     U_NORMS,
     U_SCALES,
@@ -37,10 +36,7 @@ REMOTE_DONE = "unsup_sweep.done"
 REMOTE_PID = "unsup_sweep.pid"
 
 CODE_FILES = [
-    "gnn_vsbm.py",
-    "gnn_e_vsbm.py",
     "train_lv_vsbm.py",
-    "train_lv_e.py",
     "train_ntac.py",
     "train_pca_baseline.py",
     "sparse_graph_pca.py",
@@ -185,8 +181,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--studio-name", default="flywrite-gnn-vsbm")
     parser.add_argument("--machine", default="L4")
-    parser.add_argument("--epochs", type=int, default=15, help="HP-search LV/GNN epochs")
-    parser.add_argument("--final-epochs", type=int, default=40, help="Final LV/GNN epochs")
+    parser.add_argument("--epochs", type=int, default=15, help="HP-search LV epochs")
+    parser.add_argument("--final-epochs", type=int, default=40, help="Final LV epochs")
     parser.add_argument("--minibatch", type=int, default=2048)
     parser.add_argument("--pca-max-iter", type=int, default=2_000, help="HP-search PCA steps")
     parser.add_argument("--final-pca-max-iter", type=int, default=10_000, help="Final PCA steps")
@@ -199,20 +195,18 @@ def main() -> None:
     parser.add_argument(
         "--lv-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson", "nb"]
     )
-    parser.add_argument("--lv-e-dims", type=int, nargs="+", default=[64, 128])
-    parser.add_argument("--lv-e-d-es", type=int, nargs="+", default=[16])
-    parser.add_argument("--lv-e-lrs", type=float, nargs="+", default=[0.05])
-    parser.add_argument("--lv-e-wds", type=float, nargs="+", default=[1e-2])
-    parser.add_argument("--lv-e-bfs-fracs", type=float, nargs="+", default=[1.0])
-    parser.add_argument(
-        "--lv-e-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson"]
-    )
     parser.add_argument("--bfs-seeds", type=int, default=4)
     parser.add_argument(
         "--grad-clip",
         type=float,
         default=1.0,
-        help="Global gradient-norm clip for LV / LV+e / GNN; 0 or less disables it",
+        help="Global gradient-norm clip for LV; 0 or less disables it",
+    )
+    parser.add_argument(
+        "--select-metric",
+        choices=("ll", "auc"),
+        default="ll",
+        help="Held-out metric used to rank LV configurations and pick each checkpoint",
     )
     parser.add_argument(
         "--lv-label-smoothings",
@@ -221,20 +215,15 @@ def main() -> None:
         default=[0.0],
         help="LV Bernoulli label-smoothing grid; 0.0 keeps hard 0/1 targets",
     )
-    parser.add_argument("--lv-e-label-smoothings", type=float, nargs="+", default=[0.0])
-    parser.add_argument("--gnn-label-smoothings", type=float, nargs="+", default=[0.0])
-    for flag in ("lv", "lv-e", "gnn"):
-        parser.add_argument(
-            f"--{flag}-u-norms",
-            nargs="+",
-            choices=U_NORMS,
-            default=["none"],
-            help="Block-embedding constraint grid; 'none' keeps the unbounded decoder",
-        )
-        parser.add_argument(f"--{flag}-u-scales", nargs="+", choices=U_SCALES, default=["fixed"])
-        parser.add_argument(
-            f"--{flag}-u-scale-inits", type=float, nargs="+", default=[DEFAULT_U_SCALE_INIT]
-        )
+    parser.add_argument(
+        "--lv-u-norms",
+        nargs="+",
+        choices=U_NORMS,
+        default=["none"],
+        help="Block-embedding constraint grid; 'none' keeps the unbounded decoder",
+    )
+    parser.add_argument("--lv-u-scales", nargs="+", choices=U_SCALES, default=["fixed"])
+    parser.add_argument("--lv-u-scale-inits", type=float, nargs="+", default=[DEFAULT_U_SCALE_INIT])
     parser.add_argument(
         "--label-smoothing-target",
         choices=LABEL_SMOOTHING_TARGETS,
@@ -247,36 +236,6 @@ def main() -> None:
         default=0,
         help="Total update budget for a matched-compute bfs_frac=0 LV control (0 disables)",
     )
-    parser.add_argument("--gnn-layers", type=int, nargs="+", default=[0, 1, 2, 4])
-    parser.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
-    parser.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
-    parser.add_argument("--gnn-bfs-fracs", type=float, nargs="+", default=[1.0])
-    parser.add_argument(
-        "--gnn-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson", "nb"]
-    )
-    parser.add_argument(
-        "--gnn-norms",
-        nargs="+",
-        choices=GNN_NORMS,
-        default=["none"],
-        help=(
-            "GNN residual constraint grid; 'unit' bounds gamma*(h_i.h_j), the half "
-            "of the block logit that --gnn-u-norms leaves free"
-        ),
-    )
-    parser.add_argument(
-        "--gnn-final-layers",
-        type=int,
-        nargs="*",
-        default=[],
-        help="Extra GNN depths to retrain in the multi-seed finals beside the selected one",
-    )
-    parser.add_argument("--gnn-propagation", choices=["subgraph", "full"], default="subgraph")
-    parser.add_argument("--gnn-e-layers", type=int, nargs="+", default=[0, 1, 2])
-    parser.add_argument("--gnn-e-dims", type=int, nargs="+", default=[32, 64])
-    parser.add_argument("--gnn-e-d-es", type=int, nargs="+", default=[16])
-    parser.add_argument("--gnn-e-lrs", type=float, nargs="+", default=[0.005, 0.01])
-    parser.add_argument("--gnn-e-wds", type=float, nargs="+", default=[1e-2])
     parser.add_argument("--ntac-max-ks", type=int, nargs="+", default=[729])
     parser.add_argument("--ntac-max-iters", type=int, nargs="+", default=[12])
     parser.add_argument("--ntac-frac-seeds", type=float, nargs="+", default=[0.1])
@@ -284,8 +243,8 @@ def main() -> None:
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=["lv", "lv_e"],
-        choices=["pca", "lv", "lv_e", "gnn", "gnn_e", "ntac"],
+        default=["pca", "lv", "ntac"],
+        choices=["pca", "lv", "ntac"],
         help="Methods to sweep",
     )
     parser.add_argument("--phase", choices=["all", "hp", "final"], default="all")
@@ -392,46 +351,20 @@ def main() -> None:
             f"--lv-dims {join_nums(args.lv_dims)} --lv-lrs {join_nums(args.lv_lrs)} "
             f"--lv-bfs-fracs {join_nums(args.lv_bfs_fracs)} "
             f"--lv-likelihoods {join_nums(args.lv_likelihoods)} "
-            f"--lv-e-dims {join_nums(args.lv_e_dims)} "
-            f"--lv-e-d-es {join_nums(args.lv_e_d_es)} "
-            f"--lv-e-lrs {join_nums(args.lv_e_lrs)} "
-            f"--lv-e-wds {join_nums(args.lv_e_wds)} "
-            f"--lv-e-bfs-fracs {join_nums(args.lv_e_bfs_fracs)} "
-            f"--lv-e-likelihoods {join_nums(args.lv_e_likelihoods)} "
             f"--bfs-seeds {args.bfs_seeds} "
             f"--grad-clip {args.grad_clip} "
+            f"--select-metric {args.select_metric} "
             f"--lv-label-smoothings {join_nums(args.lv_label_smoothings)} "
-            f"--lv-e-label-smoothings {join_nums(args.lv_e_label_smoothings)} "
-            f"--gnn-label-smoothings {join_nums(args.gnn_label_smoothings)} "
             f"--label-smoothing-target {args.label_smoothing_target} "
             f"--lv-u-norms {join_nums(args.lv_u_norms)} "
             f"--lv-u-scales {join_nums(args.lv_u_scales)} "
             f"--lv-u-scale-inits {join_nums(args.lv_u_scale_inits)} "
-            f"--lv-e-u-norms {join_nums(args.lv_e_u_norms)} "
-            f"--lv-e-u-scales {join_nums(args.lv_e_u_scales)} "
-            f"--lv-e-u-scale-inits {join_nums(args.lv_e_u_scale_inits)} "
-            f"--gnn-u-norms {join_nums(args.gnn_u_norms)} "
-            f"--gnn-u-scales {join_nums(args.gnn_u_scales)} "
-            f"--gnn-u-scale-inits {join_nums(args.gnn_u_scale_inits)} "
             f"--lv-control-updates {args.lv_control_updates} "
-            f"--gnn-layers {join_nums(args.gnn_layers)} --gnn-dims {join_nums(args.gnn_dims)} "
-            f"--gnn-lrs {join_nums(args.gnn_lrs)} "
-            f"--gnn-bfs-fracs {join_nums(args.gnn_bfs_fracs)} "
-            f"--gnn-likelihoods {join_nums(args.gnn_likelihoods)} "
-            f"--gnn-norms {join_nums(args.gnn_norms)} "
-            f"--gnn-propagation {args.gnn_propagation} "
-            f"--gnn-e-layers {join_nums(args.gnn_e_layers)} "
-            f"--gnn-e-dims {join_nums(args.gnn_e_dims)} "
-            f"--gnn-e-d-es {join_nums(args.gnn_e_d_es)} "
-            f"--gnn-e-lrs {join_nums(args.gnn_e_lrs)} "
-            f"--gnn-e-wds {join_nums(args.gnn_e_wds)} "
             f"--ntac-max-ks {join_nums(args.ntac_max_ks)} "
             f"--ntac-max-iters {join_nums(args.ntac_max_iters)} "
             f"--ntac-frac-seeds {join_nums(args.ntac_frac_seeds)} "
             f"--final-seeds {join_nums(args.final_seeds)}"
         )
-        if args.gnn_final_layers:
-            sweep_args += f" --gnn-final-layers {join_nums(args.gnn_final_layers)}"
         if args.skip_existing:
             sweep_args += " --skip-existing"
 

@@ -4,7 +4,7 @@ Protocol
 --------
 1. Build fixed held-out splits (no ground-truth types).
 2. For each method, sweep hyperparameters and select by held-out validation
-   metric (Bernoulli LL for LV/GNN; negated row reconstruction MSE for PCA).
+   metric (Bernoulli LL for LV; negated row reconstruction MSE for PCA).
 3. Retrain the selected setting with multiple seeds.
 4. Only then score against visual neuron types (Hungarian / ARI / NMI) to
    report means and standard deviations.
@@ -29,7 +29,6 @@ from evaluate_clustering import evaluate_pair, load_assignment_dict, load_ground
 from heldout import LIKELIHOODS, make_heldout_pairs, make_heldout_rows, save_heldout
 from training_utils import (
     DEFAULT_U_SCALE_INIT,
-    GNN_NORMS,
     LABEL_SMOOTHING_TARGETS,
     U_NORMS,
     U_SCALES,
@@ -44,8 +43,7 @@ class RunSpec:
     prefix: str
     hyperparams: dict
     # Rows sharing a group are aggregated into one entry of ``final_summary``.
-    # Defaults to the method; a GNN depth comparison splits one method into
-    # several groups so each depth gets its own multi-seed mean and spread.
+    # Defaults to the method name.
     group: str = ""
 
     def summary_group(self) -> str:
@@ -117,26 +115,6 @@ def u_norm_of(hp: dict) -> UNorm:
     )
 
 
-# ``--u-norm`` bounds the bilinear half of the GNN block logit; ``--gnn-norm``
-# bounds the residual half, which is the half measured to diverge. The two are
-# swept independently, so the residual constraint needs its own run-name tag.
-def gnn_norm_tag(gnn_norm: str) -> str:
-    """Run-name suffix, empty for the unconstrained residual.
-
-    As with ``u_norm_tag``, the default arm keeps the prefixes every existing
-    artefact was written under, so ``--skip-existing`` stays valid.
-    """
-    return "" if gnn_norm == "none" else f"_gnn{gnn_norm}"
-
-
-def gnn_norm_flags(gnn_norm: str) -> list[str]:
-    return ["--gnn-norm", gnn_norm]
-
-
-def gnn_norm_of(hp: dict) -> str:
-    return str(hp.get("gnn_norm", "none"))
-
-
 def run_cmd(cmd: list[str]) -> None:
     print("\n=== RUN ===")
     print(" ".join(cmd))
@@ -206,9 +184,8 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                 )
 
     if "lv" in methods:
-        # Flattened with ``product`` for the same reason as ``lv_e`` below: the
-        # grid has grown past the depth at which nested ``for`` blocks leave room
-        # for the command list.
+        # Flattened with ``product``: the grid has grown past the depth at which
+        # nested ``for`` blocks leave room for the command list.
         lv_grid = product(
             args.lv_dims,
             args.lv_lrs,
@@ -252,6 +229,8 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         likelihood,
                         "--grad-clip",
                         str(args.grad_clip),
+                        "--select-metric",
+                        args.select_metric,
                         *smoothing_flags(eps, args.label_smoothing_target),
                         *u_norm_flags(u_setting),
                         "--epochs",
@@ -318,6 +297,8 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                 likelihood,
                                 "--grad-clip",
                                 str(args.grad_clip),
+                                "--select-metric",
+                                args.select_metric,
                                 *smoothing_flags(eps, args.label_smoothing_target),
                                 *u_norm_flags(u_setting),
                                 "--target-updates",
@@ -337,200 +318,6 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                             ],
                         )
                     )
-
-    if "lv_e" in methods:
-        # Flattened with ``product``: the grid is seven-dimensional and nested
-        # ``for`` blocks would indent the command list past readability.
-        lv_e_grid = product(
-            args.lv_e_dims,
-            args.lv_e_d_es,
-            args.lv_e_lrs,
-            args.lv_e_wds,
-            args.lv_e_bfs_fracs,
-            args.lv_e_likelihoods,
-            args.lv_e_label_smoothings,
-            u_norm_settings(args.lv_e_u_norms, args.lv_e_u_scales, args.lv_e_u_scale_inits),
-        )
-        for d, d_e, lr, e_wd, bfs_frac, likelihood, eps, u_setting in lv_e_grid:
-            name = (
-                f"hp_lv_e_d{d}_de{d_e}_lr{lr}_ewd{e_wd}"
-                f"_bfs{bfs_frac}_{likelihood}{smoothing_tag(eps)}{u_norm_tag(u_setting)}"
-            )
-            specs.append(
-                RunSpec(
-                    name=name,
-                    method="lv_e",
-                    prefix=name,
-                    hyperparams={
-                        "d": d,
-                        "d_e": d_e,
-                        "lr": lr,
-                        "e_wd": e_wd,
-                        "bfs_frac": bfs_frac,
-                        "likelihood": likelihood,
-                        "label_smoothing": eps,
-                        **u_norm_hyperparams(u_setting),
-                    },
-                    command=[
-                        py,
-                        "train_lv_e.py",
-                        "--k",
-                        str(args.k),
-                        "--d",
-                        str(d),
-                        "--d-e",
-                        str(d_e),
-                        "--e-wd",
-                        str(e_wd),
-                        "--lr",
-                        str(lr),
-                        "--bfs-frac",
-                        str(bfs_frac),
-                        "--bfs-seeds",
-                        str(args.bfs_seeds),
-                        "--likelihood",
-                        likelihood,
-                        "--grad-clip",
-                        str(args.grad_clip),
-                        *smoothing_flags(eps, args.label_smoothing_target),
-                        *u_norm_flags(u_setting),
-                        "--epochs",
-                        str(args.epochs),
-                        "--minibatch",
-                        str(args.minibatch),
-                        "--seed",
-                        str(args.split_seed),
-                        "--device",
-                        args.device,
-                        "--heldout-pairs",
-                        args.heldout_pairs,
-                        "--out-prefix",
-                        name,
-                    ],
-                )
-            )
-
-    if "gnn" in methods:
-        gnn_grid = product(
-            args.gnn_layers,
-            args.gnn_dims,
-            args.gnn_lrs,
-            args.gnn_bfs_fracs,
-            args.gnn_likelihoods,
-            args.gnn_label_smoothings,
-            u_norm_settings(args.gnn_u_norms, args.gnn_u_scales, args.gnn_u_scale_inits),
-            args.gnn_norms,
-        )
-        for layers, d, lr, bfs_frac, likelihood, eps, u_setting, gnn_norm in gnn_grid:
-            name = (
-                f"hp_gnn_L{layers}_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}"
-                f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}{gnn_norm_tag(gnn_norm)}"
-            )
-            specs.append(
-                RunSpec(
-                    name=name,
-                    method="gnn",
-                    prefix=name,
-                    hyperparams={
-                        "layers": layers,
-                        "d": d,
-                        "lr": lr,
-                        "bfs_frac": bfs_frac,
-                        "likelihood": likelihood,
-                        "label_smoothing": eps,
-                        **u_norm_hyperparams(u_setting),
-                        "gnn_norm": gnn_norm,
-                    },
-                    command=[
-                        py,
-                        "gnn_vsbm.py",
-                        "--k",
-                        str(args.k),
-                        "--d",
-                        str(d),
-                        "--layers",
-                        str(layers),
-                        "--lr",
-                        str(lr),
-                        "--bfs-frac",
-                        str(bfs_frac),
-                        "--bfs-seeds",
-                        str(args.bfs_seeds),
-                        "--likelihood",
-                        likelihood,
-                        "--propagation",
-                        args.gnn_propagation,
-                        "--grad-clip",
-                        str(args.grad_clip),
-                        *smoothing_flags(eps, args.label_smoothing_target),
-                        *u_norm_flags(u_setting),
-                        *gnn_norm_flags(gnn_norm),
-                        "--epochs",
-                        str(args.epochs),
-                        "--minibatch",
-                        str(args.minibatch),
-                        "--seed",
-                        str(args.split_seed),
-                        "--device",
-                        args.device,
-                        "--heldout-pairs",
-                        args.heldout_pairs,
-                        "--out-prefix",
-                        name,
-                    ],
-                )
-            )
-
-    if "gnn_e" in methods:
-        for layers in args.gnn_e_layers:
-            for d in args.gnn_e_dims:
-                for d_e in args.gnn_e_d_es:
-                    for lr in args.gnn_e_lrs:
-                        for e_wd in args.gnn_e_wds:
-                            name = f"hp_gnn_e_L{layers}_d{d}_de{d_e}_lr{lr}_ewd{e_wd}"
-                            prefix = name
-                            specs.append(
-                                RunSpec(
-                                    name=name,
-                                    method="gnn_e",
-                                    prefix=prefix,
-                                    hyperparams={
-                                        "layers": layers,
-                                        "d": d,
-                                        "d_e": d_e,
-                                        "lr": lr,
-                                        "e_wd": e_wd,
-                                    },
-                                    command=[
-                                        py,
-                                        "gnn_e_vsbm.py",
-                                        "--k",
-                                        str(args.k),
-                                        "--d",
-                                        str(d),
-                                        "--d-e",
-                                        str(d_e),
-                                        "--e-wd",
-                                        str(e_wd),
-                                        "--layers",
-                                        str(layers),
-                                        "--lr",
-                                        str(lr),
-                                        "--epochs",
-                                        str(args.epochs),
-                                        "--minibatch",
-                                        str(args.minibatch),
-                                        "--seed",
-                                        str(args.split_seed),
-                                        "--device",
-                                        args.device,
-                                        "--heldout-pairs",
-                                        args.heldout_pairs,
-                                        "--out-prefix",
-                                        prefix,
-                                    ],
-                                )
-                            )
 
     if "ntac" in methods:
         for max_k in args.ntac_max_ks:
@@ -571,28 +358,9 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
     return specs
 
 
-def gnn_final_variants(args: argparse.Namespace, hp: dict) -> list[dict]:
-    """Selected GNN configuration, plus the same configuration at other depths.
-
-    Held-out likelihood is known to prefer the deepest arm while ground truth
-    prefers the shallowest, so running the multi-seed finals only at the selected
-    depth would leave the size of that disagreement resting on the single-seed HP
-    rows. ``--gnn-final-layers`` retrains the comparison depths under the
-    identical protocol, which is the only way to say whether the gap survives
-    seed noise.
-    """
-    depths = [int(hp["layers"]), *(int(x) for x in args.gnn_final_layers)]
-    return [{**hp, "layers": depth} for depth in dict.fromkeys(depths)]
-
-
-def final_variants(args: argparse.Namespace, method: str, hp: dict) -> list[tuple[str, dict]]:
+def final_variants(_args: argparse.Namespace, method: str, hp: dict) -> list[tuple[str, dict]]:
     """``(summary group, hyperparameters)`` for each final arm of one method."""
-    if method != "gnn":
-        return [(method, hp)]
-    variants = gnn_final_variants(args, hp)
-    if len(variants) == 1:
-        return [(method, variants[0])]
-    return [(f"{method}_L{v['layers']}", v) for v in variants]
+    return [(method, hp)]
 
 
 def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> list[RunSpec]:
@@ -653,6 +421,8 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     str(hp["likelihood"]),
                     "--grad-clip",
                     str(args.grad_clip),
+                    "--select-metric",
+                    args.select_metric,
                     *smoothing_flags(eps, args.label_smoothing_target),
                     *u_norm_flags(u_setting),
                     "--minibatch",
@@ -672,130 +442,6 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     cmd += ["--target-updates", str(scaled), "--epochs", str(10**9)]
                 else:
                     cmd += ["--epochs", str(args.final_epochs)]
-            elif method == "lv_e":
-                eps = float(hp.get("label_smoothing", 0.0))
-                u_setting = u_norm_of(hp)
-                name = (
-                    f"final_lv_e_d{hp['d']}_de{hp['d_e']}_lr{hp['lr']}_ewd{hp['e_wd']}_"
-                    f"bfs{hp['bfs_frac']}_{hp['likelihood']}"
-                    f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}_seed{seed}"
-                )
-                cmd = [
-                    py,
-                    "train_lv_e.py",
-                    "--k",
-                    str(args.k),
-                    "--d",
-                    str(hp["d"]),
-                    "--d-e",
-                    str(hp["d_e"]),
-                    "--e-wd",
-                    str(hp["e_wd"]),
-                    "--lr",
-                    str(hp["lr"]),
-                    "--bfs-frac",
-                    str(hp["bfs_frac"]),
-                    "--bfs-seeds",
-                    str(args.bfs_seeds),
-                    "--likelihood",
-                    str(hp["likelihood"]),
-                    "--grad-clip",
-                    str(args.grad_clip),
-                    *smoothing_flags(eps, args.label_smoothing_target),
-                    *u_norm_flags(u_setting),
-                    "--epochs",
-                    str(args.final_epochs),
-                    "--minibatch",
-                    str(args.minibatch),
-                    "--seed",
-                    str(seed),
-                    "--device",
-                    args.device,
-                    "--heldout-pairs",
-                    args.heldout_pairs,
-                    "--out-prefix",
-                    name,
-                ]
-            elif method == "gnn_e":
-                name = (
-                    f"final_gnn_e_L{hp['layers']}_d{hp['d']}_de{hp['d_e']}_"
-                    f"lr{hp['lr']}_ewd{hp['e_wd']}_seed{seed}"
-                )
-                cmd = [
-                    py,
-                    "gnn_e_vsbm.py",
-                    "--k",
-                    str(args.k),
-                    "--d",
-                    str(hp["d"]),
-                    "--d-e",
-                    str(hp["d_e"]),
-                    "--e-wd",
-                    str(hp["e_wd"]),
-                    "--layers",
-                    str(hp["layers"]),
-                    "--lr",
-                    str(hp["lr"]),
-                    "--epochs",
-                    str(args.final_epochs),
-                    "--minibatch",
-                    str(args.minibatch),
-                    "--seed",
-                    str(seed),
-                    "--device",
-                    args.device,
-                    "--heldout-pairs",
-                    args.heldout_pairs,
-                    "--out-prefix",
-                    name,
-                ]
-            elif method == "gnn":
-                eps = float(hp.get("label_smoothing", 0.0))
-                u_setting = u_norm_of(hp)
-                gnn_norm = gnn_norm_of(hp)
-                name = (
-                    f"final_gnn_L{hp['layers']}_d{hp['d']}_lr{hp['lr']}_"
-                    f"bfs{hp['bfs_frac']}_{hp['likelihood']}"
-                    f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}{gnn_norm_tag(gnn_norm)}"
-                    f"_seed{seed}"
-                )
-                cmd = [
-                    py,
-                    "gnn_vsbm.py",
-                    "--k",
-                    str(args.k),
-                    "--d",
-                    str(hp["d"]),
-                    "--layers",
-                    str(hp["layers"]),
-                    "--lr",
-                    str(hp["lr"]),
-                    "--bfs-frac",
-                    str(hp["bfs_frac"]),
-                    "--bfs-seeds",
-                    str(args.bfs_seeds),
-                    "--likelihood",
-                    str(hp["likelihood"]),
-                    "--propagation",
-                    str(hp.get("propagation", args.gnn_propagation)),
-                    "--grad-clip",
-                    str(args.grad_clip),
-                    *smoothing_flags(eps, args.label_smoothing_target),
-                    *u_norm_flags(u_setting),
-                    *gnn_norm_flags(gnn_norm),
-                    "--epochs",
-                    str(args.final_epochs),
-                    "--minibatch",
-                    str(args.minibatch),
-                    "--seed",
-                    str(seed),
-                    "--device",
-                    args.device,
-                    "--heldout-pairs",
-                    args.heldout_pairs,
-                    "--out-prefix",
-                    name,
-                ]
             elif method == "ntac":
                 name = (
                     f"final_ntac_k{hp['max_k']}_R{hp['max_iterations']}_"
@@ -858,14 +504,6 @@ DIAGNOSTIC_KEYS = (
     "decoder_bias",
     "last_decoder_bias",
     "max_abs_train_logit",
-    # The GNN block logit splits as eta_LV + eta_GNN and only the first is
-    # bounded by --u-norm. Reporting the two halves and the residual mixing
-    # coefficient is what makes "the residual, not the assignment, carries the
-    # edge model" a claim the tables can settle rather than one read off a log.
-    "max_abs_train_lv_logit",
-    "max_abs_train_residual",
-    "gamma",
-    "last_gamma",
     "skipped_updates",
 )
 
@@ -913,12 +551,12 @@ def main() -> None:
     p.add_argument("--gt", default="root_id_type_dict.pkl")
     p.add_argument("--device", default="cuda")
     p.add_argument("--k", type=int, default=729)
-    p.add_argument("--epochs", type=int, default=5, help="HP-search epoch budget for LV/GNN")
+    p.add_argument("--epochs", type=int, default=5, help="HP-search epoch budget for LV")
     p.add_argument(
         "--final-epochs",
         type=int,
         default=20,
-        help="Full epoch budget for multi-seed final LV/GNN runs",
+        help="Full epoch budget for multi-seed final LV runs",
     )
     p.add_argument("--minibatch", type=int, default=2048)
     p.add_argument("--pca-max-iter", type=int, default=2_000, help="HP-search PCA SGD steps")
@@ -942,17 +580,7 @@ def main() -> None:
     p.add_argument(
         "--lv-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson", "nb"]
     )
-    p.add_argument("--lv-e-dims", type=int, nargs="+", default=[64, 128])
-    p.add_argument("--lv-e-d-es", type=int, nargs="+", default=[16])
-    p.add_argument("--lv-e-lrs", type=float, nargs="+", default=[0.05])
-    p.add_argument("--lv-e-wds", type=float, nargs="+", default=[1e-2])
-    p.add_argument("--lv-e-bfs-fracs", type=float, nargs="+", default=[1.0])
-    p.add_argument(
-        "--lv-e-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson"]
-    )
-    p.add_argument(
-        "--bfs-seeds", type=int, default=4, help="BFS seeds per expansion round (LV / LV+e / GNN)"
-    )
+    p.add_argument("--bfs-seeds", type=int, default=4, help="BFS seeds per expansion round for LV")
     p.add_argument(
         "--grad-clip",
         type=float,
@@ -961,6 +589,17 @@ def main() -> None:
             "Global gradient-norm clip for LV / LV+e / GNN; 0 or less disables it. "
             "Clipping alone does not prevent the lr=0.1 decoder divergence, so pair "
             "it with a smaller --lv-lrs"
+        ),
+    )
+    p.add_argument(
+        "--select-metric",
+        choices=("ll", "auc"),
+        default="ll",
+        help=(
+            "Held-out metric used to rank LV configurations and pick each run's "
+            "checkpoint. The held-out pairs are class-balanced while the graph is "
+            "sparse, so a correctly calibrated model scores poorly under 'll'; use "
+            "'auc' when log-likelihood peaks at initialization"
         ),
     )
     p.add_argument(
@@ -974,36 +613,29 @@ def main() -> None:
         ),
     )
     p.add_argument(
-        "--lv-e-label-smoothings", type=float, nargs="+", default=[0.0], help="LV+e smoothing grid"
+        "--lv-u-norms",
+        nargs="+",
+        choices=U_NORMS,
+        default=["none"],
+        help=(
+            "LV block-embedding constraint grid; 'none' (default) keeps the "
+            "unbounded bilinear decoder and the historical run names"
+        ),
     )
     p.add_argument(
-        "--gnn-label-smoothings", type=float, nargs="+", default=[0.0], help="GNN smoothing grid"
+        "--lv-u-scales",
+        nargs="+",
+        choices=U_SCALES,
+        default=["fixed"],
+        help="LV scale parameterisation grid, swept only under u_norm=unit",
     )
-    for method, flag in (("LV", "lv"), ("LV+e", "lv-e"), ("GNN", "gnn")):
-        p.add_argument(
-            f"--{flag}-u-norms",
-            nargs="+",
-            choices=U_NORMS,
-            default=["none"],
-            help=(
-                f"{method} block-embedding constraint grid; 'none' (default) keeps the "
-                "unbounded bilinear decoder and the historical run names"
-            ),
-        )
-        p.add_argument(
-            f"--{flag}-u-scales",
-            nargs="+",
-            choices=U_SCALES,
-            default=["fixed"],
-            help=f"{method} scale parameterisation grid, swept only under u_norm=unit",
-        )
-        p.add_argument(
-            f"--{flag}-u-scale-inits",
-            type=float,
-            nargs="+",
-            default=[DEFAULT_U_SCALE_INIT],
-            help=f"{method} scale value / initialisation grid, swept only under u_norm=unit",
-        )
+    p.add_argument(
+        "--lv-u-scale-inits",
+        type=float,
+        nargs="+",
+        default=[DEFAULT_U_SCALE_INIT],
+        help="LV scale value / initialisation grid, swept only under u_norm=unit",
+    )
     p.add_argument(
         "--label-smoothing-target",
         choices=LABEL_SMOOTHING_TARGETS,
@@ -1023,52 +655,6 @@ def main() -> None:
             "matching the compute of the BFS arms (0 disables the control)"
         ),
     )
-    p.add_argument("--gnn-layers", type=int, nargs="+", default=[0, 1, 2, 4])
-    p.add_argument("--gnn-dims", type=int, nargs="+", default=[32, 64])
-    p.add_argument("--gnn-lrs", type=float, nargs="+", default=[0.005, 0.01])
-    p.add_argument("--gnn-bfs-fracs", type=float, nargs="+", default=[1.0])
-    p.add_argument(
-        "--gnn-likelihoods", nargs="+", choices=LIKELIHOODS, default=["bernoulli", "poisson", "nb"]
-    )
-    p.add_argument(
-        "--gnn-norms",
-        nargs="+",
-        choices=GNN_NORMS,
-        default=["none"],
-        help=(
-            "GNN residual constraint grid. 'none' (default) leaves "
-            "gamma * (h_i . h_j) unbounded -- the half of the block logit that "
-            "--gnn-u-norms does not reach and the half measured to diverge; "
-            "'unit' makes the residual a cosine similarity, so |eta_GNN| <= |gamma|"
-        ),
-    )
-    p.add_argument(
-        "--gnn-final-layers",
-        type=int,
-        nargs="*",
-        default=[],
-        help=(
-            "Extra GNN depths to retrain in the multi-seed finals alongside the "
-            "selected one, holding every other selected hyperparameter fixed. "
-            "Each depth is summarised separately, which is what turns the "
-            "depth-versus-ground-truth comparison into a multi-seed statement"
-        ),
-    )
-    p.add_argument(
-        "--gnn-propagation",
-        choices=["subgraph", "full"],
-        default="subgraph",
-        help=(
-            "Training-time GNN message passing. 'subgraph' (default) propagates over "
-            "the sampled block only; 'full' propagates over all nodes each step and "
-            "costs several times more per update"
-        ),
-    )
-    p.add_argument("--gnn-e-layers", type=int, nargs="+", default=[0, 1, 2])
-    p.add_argument("--gnn-e-dims", type=int, nargs="+", default=[32, 64])
-    p.add_argument("--gnn-e-d-es", type=int, nargs="+", default=[16])
-    p.add_argument("--gnn-e-lrs", type=float, nargs="+", default=[0.005, 0.01])
-    p.add_argument("--gnn-e-wds", type=float, nargs="+", default=[1e-2])
     p.add_argument("--ntac-max-ks", type=int, nargs="+", default=[729])
     p.add_argument("--ntac-max-iters", type=int, nargs="+", default=[12])
     p.add_argument("--ntac-frac-seeds", type=float, nargs="+", default=[0.1])
@@ -1076,8 +662,8 @@ def main() -> None:
     p.add_argument(
         "--methods",
         nargs="+",
-        default=["pca", "lv", "lv_e", "gnn", "gnn_e", "ntac"],
-        choices=["pca", "lv", "lv_e", "gnn", "gnn_e", "ntac"],
+        default=["pca", "lv", "ntac"],
+        choices=["pca", "lv", "ntac"],
         help="Which methods to include in HP search / finals",
     )
     p.add_argument("--skip-existing", action="store_true")
@@ -1126,26 +712,15 @@ def main() -> None:
                 continue
             best = max(cand, key=lambda r: r["val_metric"])
             hp = {"d": int(best["d"]), "lr": float(best["lr"])}
-            if method == "gnn":
-                hp["layers"] = int(best["layers"])
-                hp["propagation"] = args.gnn_propagation
-                hp["gnn_norm"] = gnn_norm_of(best)
-            if method in {"lv", "lv_e", "gnn"}:
+            if method == "lv":
                 hp["bfs_frac"] = float(best["bfs_frac"])
                 hp["likelihood"] = str(best["likelihood"])
                 hp["label_smoothing"] = float(best.get("label_smoothing", 0.0))
                 hp.update(u_norm_hyperparams(u_norm_of(best)))
-            if method == "lv" and best.get("target_updates"):
-                # Carry the matched-compute budget so a selected control stays a
-                # control in the finals instead of reverting to epoch matching.
-                hp["target_updates"] = int(best["target_updates"])
-            if method == "lv_e":
-                hp["d_e"] = int(best["d_e"])
-                hp["e_wd"] = float(best["e_wd"])
-            if method == "gnn_e":
-                hp["layers"] = int(best["layers"])
-                hp["d_e"] = int(best["d_e"])
-                hp["e_wd"] = float(best["e_wd"])
+                if best.get("target_updates"):
+                    # Carry the matched-compute budget so a selected control stays a
+                    # control in the finals instead of reverting to epoch matching.
+                    hp["target_updates"] = int(best["target_updates"])
             if method == "ntac":
                 hp = {
                     "d": int(best["d"]),
@@ -1207,9 +782,7 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(final_rows)
 
-        # Uncertainty summary, one entry per group. A group is a method unless
-        # extra GNN depths were retrained, in which case each depth is summarised
-        # on its own and only one of them is the arm validation actually chose.
+        # Uncertainty summary, one entry per group (one group per method).
         summary = []
         variant_hp = {
             group: hp

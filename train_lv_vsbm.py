@@ -292,6 +292,7 @@ def train(args: argparse.Namespace) -> dict:
         seed=args.seed,
     )
     checkpoint = BestCheckpoint()
+    select_auc = args.select_metric == "auc"
     cum_pos_obs = 0
     total_updates = 0
     n_skipped = 0
@@ -370,12 +371,12 @@ def train(args: argparse.Namespace) -> dict:
                 dtype,
                 scale=scale,
             )
-            checkpoint.update(val_ll, epoch, state)
+            checkpoint.update(val_auc if select_auc else val_ll, epoch, state)
             n_used = int(torch.unique(torch.argmax(q_logits, dim=-1)).numel())
             print(decoder_line(epoch, float(bias.item()), scale))
             print(
                 f"loss={mean_loss:.4f} val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
-                f"best_val_ll={checkpoint.metric:.6f}@{checkpoint.epoch} "
+                f"best_val_{args.select_metric}={checkpoint.metric:.6f}@{checkpoint.epoch} "
                 f"clusters={n_used}/{args.k} max_abs_logit={epoch_max_abs_eta:.3f} "
                 f"updates={total_updates} skipped={n_skipped}"
             )
@@ -429,13 +430,16 @@ def train(args: argparse.Namespace) -> dict:
         np.save(f"{prefix}_last_assignment_dict.npy", last.assignment_dict)
     metrics = {
         "method": "lv_vsbm",
-        "val_metric": best.val_ll,
-        "val_metric_name": "heldout_bernoulli_ll",
+        "val_metric": best.val_auc if select_auc else best.val_ll,
+        "val_metric_name": "heldout_auc" if select_auc else "heldout_bernoulli_ll",
         "val_metric_higher_is_better": True,
+        "select_metric": args.select_metric,
+        "val_bernoulli_ll": best.val_ll,
         "val_native_ll": best.native_ll,
         "val_native_ll_name": native_ll_name(args.likelihood),
         "val_auc": best.val_auc,
-        "last_val_metric": last.val_ll,
+        "last_val_metric": last.val_auc if select_auc else last.val_ll,
+        "last_val_bernoulli_ll": last.val_ll,
         "last_val_native_ll": last.native_ll,
         "last_val_auc": last.val_auc,
         **checkpoint_metrics(checkpoint, last_epoch),
@@ -498,6 +502,16 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Total update budget, overriding --epochs; matches compute across bfs_frac",
     )
     p.add_argument("--lr", type=float, default=1e-1)
+    p.add_argument(
+        "--select-metric",
+        choices=("ll", "auc"),
+        default="ll",
+        help=(
+            "Held-out metric used to pick the reported checkpoint and to rank "
+            "configurations. 'auc' is calibration-invariant, which matters when the "
+            "held-out pairs are class-balanced but the graph is sparse"
+        ),
+    )
     p.add_argument(
         "--bfs-frac",
         type=float,

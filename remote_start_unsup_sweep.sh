@@ -44,9 +44,6 @@ fi
 pkill -f 'python run_experiments.py' 2>/dev/null || true
 pkill -f 'train_pca_baseline.py' 2>/dev/null || true
 pkill -f 'train_lv_vsbm.py' 2>/dev/null || true
-pkill -f 'train_lv_e.py' 2>/dev/null || true
-pkill -f 'gnn_vsbm.py' 2>/dev/null || true
-pkill -f 'gnn_e_vsbm.py' 2>/dev/null || true
 pkill -f 'train_ntac.py' 2>/dev/null || true
 rm -f "$DONE"
 if [ "$CLEAN_ARTIFACTS" = "1" ]; then

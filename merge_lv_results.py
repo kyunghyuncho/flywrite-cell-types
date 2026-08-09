@@ -1,7 +1,7 @@
-"""Re-attach earlier PCA/NTAC records to the freshly downloaded LV/LV+e artefacts.
+"""Re-attach earlier PCA/NTAC records to freshly downloaded LV artefacts.
 
 ``remote_start_unsup_sweep.sh`` clears ``hp_*``/``final_*`` on the Studio before
-each sweep, so the artefacts retrieved after an ``--methods lv lv_e`` run contain
+each sweep, so the artefacts retrieved after an ``--methods lv`` run contain
 *only* the latent-variable rows. The earlier PCA baseline and the reconstructed
 NTAC records (see ``merge_ntac_results.py``) live solely in the local files that
 the download overwrites, and we want them retained for cross-method comparison.

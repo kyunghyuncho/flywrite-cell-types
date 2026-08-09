@@ -194,11 +194,6 @@ def label_smoothing_line(eps: float, base_rate: float, target: str) -> str:
 U_NORMS = ("none", "unit")
 U_SCALES = ("fixed", "learned", "per_row")
 
-# The GNN residual is the other half of the block logit and is bounded by a
-# separate switch (see ``gnn_vsbm.GNNvSBM.residual_embeddings``). The vocabulary
-# lives here so the sweep drivers can validate it without importing the model.
-GNN_NORMS = ("none", "unit")
-
 # The bias carries the base rate, $b = \log(1.5\times10^{-4}) \approx -8.8$, and
 # the scale is the entire budget the decoder has for departing from it. A block
 # of density 0.1 sits at $\eta \approx -2.2$, i.e. $+6.6$ above $b$; the densest

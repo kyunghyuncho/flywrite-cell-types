@@ -2,7 +2,7 @@
 
 Wraps the official ``ntac`` package
 (https://github.com/BenJourdan/ntac) so we can evaluate approximate equitable
-partitioning under the same FlyWire protocol as LV / LV+e.
+partitioning under the same FlyWire protocol as LV.
 
 Unsupervised selection metric: negated mean Jaccard cost of the best
 (lowest-cost) partition returned by unseeded NTAC (higher is better).
