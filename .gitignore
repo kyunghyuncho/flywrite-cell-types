@@ -21,7 +21,11 @@ ntac_hp_results.json
 *.prentac.bak
 *.prelv.bak
 *.premerge.bak
-*_sweep_results/
+# Downloaded sweep artifacts, kept locally and merged into the canonical tables
+# rather than tracked. Broad enough to cover the numbered and dated variants
+# (gnn_sweep2_results/, gnn_sweep_results_20260809/), which a literal
+# "_sweep_results/" misses.
+*sweep*results*/
 heldout_pairs.npz
 heldout_rows.npz
 *_metrics.json

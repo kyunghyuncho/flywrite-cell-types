@@ -858,6 +858,14 @@ DIAGNOSTIC_KEYS = (
     "decoder_bias",
     "last_decoder_bias",
     "max_abs_train_logit",
+    # The GNN block logit splits as eta_LV + eta_GNN and only the first is
+    # bounded by --u-norm. Reporting the two halves and the residual mixing
+    # coefficient is what makes "the residual, not the assignment, carries the
+    # edge model" a claim the tables can settle rather than one read off a log.
+    "max_abs_train_lv_logit",
+    "max_abs_train_residual",
+    "gamma",
+    "last_gamma",
     "skipped_updates",
 )
 

@@ -114,13 +114,24 @@ def download_tables(studio: Studio, dest: Path) -> None:
     accumulated canonical tables intact until ``merge_sweep_results.py`` runs.
     """
     dest.mkdir(parents=True, exist_ok=True)
+    # ``find`` rather than a glob list: the Studio shell is zsh, where a single
+    # unmatched pattern aborts the whole command, and a partial sweep legitimately
+    # has no finals and no tables yet.
+    patterns = (
+        "hp_*_metrics.json",
+        "final_*_metrics.json",
+        "hp_results.*",
+        "hp_best.json",
+        "final_results.*",
+        "final_summary.*",
+        REMOTE_LOG,
+    )
+    predicate = " -o ".join(f"-name '{p}'" for p in patterns)
     build = (
         "cd /teamspace/studios/this_studio && "
         f"rm -f {REMOTE_BUNDLE} && "
-        f"tar czf {REMOTE_BUNDLE} "
-        "$(ls -1 hp_*_metrics.json final_*_metrics.json hp_results.json hp_results.csv "
-        "hp_best.json final_results.json final_results.csv final_summary.json "
-        f"final_summary.csv {REMOTE_LOG} 2>/dev/null) && "
+        f"find . -maxdepth 1 \\( {predicate} \\) -print0 | "
+        f"tar czf {REMOTE_BUNDLE} --null -T - && "
         f"ls -l {REMOTE_BUNDLE}"
     )
     out, code = studio_run(studio, build)
@@ -442,6 +453,9 @@ def main() -> None:
             "/teamspace/studios/this_studio/remote_stop_studio.py && "
             f"SWEEP_ARGS={sweep_args!r} "
             f"REMOTE_STOP_AFTER={'1' if args.remote_stop_after else '0'} "
+            # --skip-existing exists to reuse completed runs; wiping them first
+            # would make it a no-op, so resuming implies keeping the artefacts.
+            f"CLEAN_ARTIFACTS={'0' if args.skip_existing else '1'} "
             "bash /teamspace/studios/this_studio/remote_start_unsup_sweep.sh"
         )
         out, code = studio_run(studio, start_cmd)

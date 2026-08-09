@@ -46,8 +46,13 @@ control still reaches $21\,151$–$22\,451$ there
 (§ *The 40-epoch constraint sweep*).
 
 The GNN-augmented decoder is a **better edge model and a worse cell-type model**
-once it is stabilised, which is an unresolved methodological problem for a
-project that selects on held-out edge likelihood. See
+once it is stabilised. Its best stabilised arm reaches Hungarian $15\,715$
+against LV's $24\,300$, and its held-out likelihood is *negatively* rank
+-correlated with ground truth ($\rho=-0.536$, against $+0.954$ for LV), so
+selecting it the way this project selects everything else picks its worst
+clustering. Its sweep was stopped early on that basis and it has **no multi-seed
+finals row** above; the single-seed HP runs are in `hp_results.json`. This is the
+open methodological problem of the project, not a tuning deficit — see
 § *The GNN wins the objective and loses the science*.
 
 ## Data
@@ -1117,14 +1122,67 @@ a separate question about edge likelihood. A principled selection criterion that
 is unsupervised *and* prefers assignment-carried structure is an open question.
 
 **Status of the evidence.** The tables above are single runs (two seeds where
-stated) from a local CPU-only $2\times2$ study at $d=64$, deliberately cheap. A
-multi-seed remote sweep over depth $\times$ learning rate with the residual bound
-active is in flight at the time of writing; its numbers are not yet available and
-will supersede these. The earlier remote GNN sweep was **aborted**: its $20$
-rescued metric files (`gnn_sweep_results/`) predate `--gnn-norm`, and every arm
-with $L>0$ diverged there, as did $L=0$ at $\mathrm{lr}=0.05$ — only $L=0$ at
-$\mathrm{lr}=0.01$ survived, at AUC $0.937$–$0.943$. Those files are retained as a
-historical record and are not merged into the canonical tables.
+stated) from a local CPU-only $2\times2$ study at $d=64$, deliberately cheap. The
+remote sweep that was meant to supersede them is reported immediately below: it
+confirms the trend at $40$ epochs on GPU and was **stopped after $7$ of its HP
+points** because the trend was unambiguous and adverse. The earlier remote GNN
+sweep was **aborted** for a different reason: its $20$ rescued metric files
+(`gnn_sweep_results/`) predate `--gnn-norm`, and every arm with $L>0$ diverged
+there, as did $L=0$ at $\mathrm{lr}=0.05$ — only $L=0$ at $\mathrm{lr}=0.01$
+survived, at AUC $0.937$–$0.943$. Those files are retained as a historical record
+and are not merged into the canonical tables.
+
+#### The stabilised remote sweep, and why it was stopped
+
+$40$ epochs, $d=64$, `bfs_frac=1.0`, `--u-norm unit --u-scale fixed
+--u-scale-init 12 --gnn-norm unit`, seed $0$, on GPU. Seven of the planned HP
+points completed (`gnn_sweep2_results/`, merged into the canonical `hp_*`
+tables); the run was stopped there and **no multi-seed finals were run**, so the
+GNN contributes no row to `final_summary`.
+
+| $L$ | lr | val LL | val AUC | Hungarian | $\max\lvert\eta^{LV}\rvert$ | $\max\lvert\eta^{GNN}\rvert$ | ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| $0$ | $0.1$ | $-1.554$ | $0.9774$ | $\mathbf{15\,715}$ | $18.6$ | $6.7$ | $0.36$ |
+| $0$ | $0.03$ | $-1.202$ | $0.9911$ | $13\,842$ | $29.0$ | $17.2$ | $0.59$ |
+| $0$ | $0.01$ | $-1.350$ | $0.9881$ | $8\,162$ | $28.1$ | $18.1$ | $0.65$ |
+| $1$ | $0.1$ | $-1.259$ | $0.9817$ | $7\,646$ | $37.1$ | $32.0$ | $0.86$ |
+| $1$ | $0.03$ | $-1.245$ | $0.9901$ | $6\,444$ | $33.8$ | $28.6$ | $0.85$ |
+| $1$ | $0.01$ | $-1.263$ | $0.9890$ | $3\,355$ | $23.6$ | $23.8$ | $1.01$ |
+| $2$ | $0.01$ | $\mathbf{-1.154}$ | $0.9893$ | $2\,712$ | $23.1$ | $22.9$ | $0.99$ |
+
+The best GNN arm reaches $15\,715$ against the constrained LV's
+$24\,300\pm972$, so **no GNN configuration tried here is competitive with simply
+removing the GNN**, and depth still costs roughly a factor two per layer with the
+residual bound active. Two numbers make the selection problem quantitative rather
+than anecdotal:
+
+* Spearman $\rho$ between `val_metric` and `gt_hungarian` is $+0.954$ across the
+  $42$ LV rows and $-0.536$ across these $7$ GNN rows. Unsupervised selection is
+  a good proxy for cell-type recovery on LV and an actively misleading one on the
+  GNN. AUC behaves the same way ($+0.965$ against $-0.321$).
+* Selecting on `val_metric` picks $L=2,\ \mathrm{lr}=0.01$ — the best held-out
+  likelihood in the entire table and the **worst** clustering in it. That choice
+  costs $13\,003$ Hungarian, a factor of $5.8$, relative to the $L=0$ arm the same
+  table contains.
+
+The residual-to-bilinear ratio in the last column orders the whole table: its
+Spearman $\rho$ with `gt_hungarian` is $-0.929$ over the seven runs. Depth alone
+scores $-0.926$, statistically indistinguishable at $n=7$, so the ratio is not a
+*better predictor* than depth and should not be sold as one. What it adds is a
+mechanism rather than a knob, and it accounts for the variation depth cannot:
+within $L=0$, where depth is constant, the ratio still moves $0.36\to0.65$ and
+Hungarian falls $15\,715\to8\,162$ alongside it.
+
+The GNN residual is a **bypass**. Every logit of edge structure it absorbs is a
+logit not forced through the cluster assignment, so the configurations that model
+edges best are precisely those that leave the assignment carrying least — which
+is what a bounded $\eta^{LV}$ makes measurable instead of merely arguable.
+`--gnn-norm unit` bounds the residual's *growth* and stops the divergence, but it
+does not stop the residual from winning the competition for explanatory work.
+
+Stopping was therefore a judgement that further HP points would refine a number
+that is not the number of interest. Recovering the tables from an interrupted
+sweep is what `rebuild_tables_from_metrics.py` is for.
 
 #### Scale parameterisation under the residual bound
 
@@ -1255,7 +1313,32 @@ hyperparameters, so its `hp_best`, its finals and its `final_summary` form one
 internally consistent statement, and splicing new rows into an older grid for the
 same method would leave a table whose selected configuration is not the one its
 finals were run at. The downloaded sweeps are kept under
-`lv_sweep_results/` and `gnn_sweep_results/`.
+`lv_sweep_results/`, `gnn_sweep_results/` and `gnn_sweep2_results/`.
+
+#### Recovering a sweep that was stopped part way
+
+`run_experiments.py` accumulates HP rows in memory and writes `hp_results.*` and
+`hp_best.json` only once the whole grid finishes, so a sweep that is cut short —
+because it diverged, ran out of time, or was stopped once its trend was clear —
+leaves each completed run's `<name>_metrics.json` with no table tying them
+together, and `merge_sweep_results.py` has nothing to consume.
+[`rebuild_tables_from_metrics.py`](rebuild_tables_from_metrics.py) reconstructs
+the tables from the metrics files alone, after which the truncated sweep merges
+on the same footing as a complete one:
+
+```bash
+uv run python rebuild_tables_from_metrics.py --source gnn_sweep2_results --method gnn --dry-run
+uv run python rebuild_tables_from_metrics.py --source gnn_sweep2_results --method gnn
+uv run python merge_sweep_results.py --source gnn_sweep2_results
+```
+
+Ground-truth columns are copied from the metrics rather than recomputed, so the
+reconstruction runs without the large assignment `.npy` files that are usually
+left on the Studio, and hyperparameter columns are read back off each run rather
+than re-derived from a grid specification the partial output no longer
+determines. Every reconstructed row carries `partial: true`, because the
+resulting `hp_best` is the argmax of the runs that *completed* — the best of what
+ran, not the best of what was asked for.
 
 [`merge_lv_results.py`](merge_lv_results.py) and
 [`merge_ntac_results.py`](merge_ntac_results.py) are the two earlier,

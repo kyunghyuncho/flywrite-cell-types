@@ -37,6 +37,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from run_experiments import DIAGNOSTIC_KEYS
+
 ROW_TARGETS = (
     "hp_results.csv",
     "hp_results.json",
@@ -93,6 +95,29 @@ def methods_in(rows: list[dict[str, Any]]) -> set[str]:
     return {str(r["method"]) for r in rows if r.get("method")}
 
 
+def enrich(rows: list[dict[str, Any]], source: Path) -> list[dict[str, Any]]:
+    """Backfill diagnostic columns from the per-run metrics beside the tables.
+
+    A sweep launched before a diagnostic joined ``DIAGNOSTIC_KEYS`` wrote that
+    quantity into its ``*_metrics.json`` but not into its tables. The metrics
+    files travel with the tables, so the column can be recovered rather than
+    lost to the version of the code that happened to be on the Studio.
+    """
+    filled = 0
+    for row in rows:
+        metrics_path = source / f"{row.get('name')}_metrics.json"
+        if not metrics_path.exists():
+            continue
+        metrics = json.loads(metrics_path.read_text())
+        for key in DIAGNOSTIC_KEYS:
+            if key in metrics and row.get(key) in (None, ""):
+                row[key] = metrics[key]
+                filled += 1
+    if filled:
+        print(f"  backfilled {filled} diagnostic value(s) from {source}")
+    return rows
+
+
 def back_up(path: Path, suffix: str, dry_run: bool) -> None:
     if not path.exists():
         return
@@ -105,7 +130,7 @@ def back_up(path: Path, suffix: str, dry_run: bool) -> None:
 def merge_rows(
     canonical: Path, incoming: Path, methods: set[str], suffix: str, dry_run: bool
 ) -> None:
-    rows_in = read_rows(incoming)
+    rows_in = enrich(read_rows(incoming), incoming.parent)
     if not rows_in:
         print(f"{canonical}: nothing to merge from {incoming}")
         return
