@@ -115,6 +115,15 @@ def u_norm_of(hp: dict) -> UNorm:
     )
 
 
+def entropy_tag(beta: float) -> str:
+    """Run-name suffix; empty at the standard ELBO weight so default names stay stable."""
+    return "" if abs(float(beta) - 1.0) < 1e-12 else f"_eb{beta:g}"
+
+
+def entropy_flags(beta: float) -> list[str]:
+    return ["--entropy-beta", str(beta)]
+
+
 def run_cmd(cmd: list[str]) -> None:
     print("\n=== RUN ===")
     print(" ".join(cmd))
@@ -192,12 +201,13 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
             args.lv_bfs_fracs,
             args.lv_likelihoods,
             args.lv_label_smoothings,
+            args.lv_entropy_betas,
             u_norm_settings(args.lv_u_norms, args.lv_u_scales, args.lv_u_scale_inits),
         )
-        for d, lr, bfs_frac, likelihood, eps, u_setting in lv_grid:
+        for d, lr, bfs_frac, likelihood, eps, entropy_beta, u_setting in lv_grid:
             name = (
                 f"hp_lv_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}"
-                f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}"
+                f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}{entropy_tag(entropy_beta)}"
             )
             specs.append(
                 RunSpec(
@@ -210,6 +220,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         "bfs_frac": bfs_frac,
                         "likelihood": likelihood,
                         "label_smoothing": eps,
+                        "entropy_beta": float(entropy_beta),
                         **u_norm_hyperparams(u_setting),
                     },
                     command=[
@@ -233,6 +244,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         args.select_metric,
                         *smoothing_flags(eps, args.label_smoothing_target),
                         *u_norm_flags(u_setting),
+                        *entropy_flags(entropy_beta),
                         "--epochs",
                         str(args.epochs),
                         "--minibatch",
@@ -258,6 +270,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
         # observation model, the target form or the decoder parameterisation, and
         # each control costs as much as a BFS run.
         u_setting = u_norm_settings(args.lv_u_norms, args.lv_u_scales, args.lv_u_scale_inits)[0]
+        entropy_beta = float(args.lv_entropy_betas[0])
         for d in args.lv_dims[:1]:
             for lr in args.lv_lrs:
                 for likelihood in args.lv_likelihoods[:1]:
@@ -265,6 +278,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                     name = (
                         f"hp_lv_control_d{d}_lr{lr}_{likelihood}"
                         f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}"
+                        f"{entropy_tag(entropy_beta)}"
                     )
                     specs.append(
                         RunSpec(
@@ -277,6 +291,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                 "bfs_frac": 0.0,
                                 "likelihood": likelihood,
                                 "label_smoothing": eps,
+                                "entropy_beta": entropy_beta,
                                 "target_updates": args.lv_control_updates,
                                 **u_norm_hyperparams(u_setting),
                             },
@@ -301,6 +316,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                 args.select_metric,
                                 *smoothing_flags(eps, args.label_smoothing_target),
                                 *u_norm_flags(u_setting),
+                                *entropy_flags(entropy_beta),
                                 "--target-updates",
                                 str(args.lv_control_updates),
                                 "--epochs",
@@ -399,10 +415,12 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                 control = hp.get("target_updates")
                 tag = "control" if control else f"bfs{hp['bfs_frac']}"
                 eps = float(hp.get("label_smoothing", 0.0))
+                entropy_beta = float(hp.get("entropy_beta", 1.0))
                 u_setting = u_norm_of(hp)
                 name = (
                     f"final_lv_d{hp['d']}_lr{hp['lr']}_{tag}_{hp['likelihood']}"
-                    f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}_seed{seed}"
+                    f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}"
+                    f"{entropy_tag(entropy_beta)}_seed{seed}"
                 )
                 cmd = [
                     py,
@@ -425,6 +443,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     args.select_metric,
                     *smoothing_flags(eps, args.label_smoothing_target),
                     *u_norm_flags(u_setting),
+                    *entropy_flags(entropy_beta),
                     "--minibatch",
                     str(args.minibatch),
                     "--seed",
@@ -497,6 +516,7 @@ DIAGNOSTIC_KEYS = (
     "grad_clip",
     "label_smoothing",
     "label_smoothing_target",
+    "entropy_beta",
     "label_smoothing_applied",
     "u_scale_value",
     "u_scale_value_max",
@@ -635,6 +655,16 @@ def main() -> None:
         nargs="+",
         default=[DEFAULT_U_SCALE_INIT],
         help="LV scale value / initialisation grid, swept only under u_norm=unit",
+    )
+    p.add_argument(
+        "--lv-entropy-betas",
+        type=float,
+        nargs="+",
+        default=[1.0],
+        help=(
+            "LV entropy-weight grid on sum_i H(q_i); 1.0 is the uniform-prior ELBO. "
+            "Non-unit values append _eb{beta} to run names"
+        ),
     )
     p.add_argument(
         "--label-smoothing-target",

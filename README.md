@@ -148,7 +148,25 @@ Shared utilities live in [`training_utils.py`](training_utils.py) and
   and which epoch is restored (default `ll` for back-compat; use `auc` when LL
   peaks at initialisation, which it does under the balanced held-out split);
 - both the best-checkpoint and last-epoch ground-truth scores are written
-  (`gt_*` vs `last_gt_*`) so selection cost is measurable within a run.
+  (`gt_*` vs `last_gt_*`) so selection cost is measurable within a run;
+- `--entropy-beta` multiplies $\sum_{i\in\mathrm{batch}} H(q_i)$ in the
+  minibatch ELBO (default $1$ = uniform-prior bound). An earlier mean-entropy
+  implementation underweighted this term by roughly the batch size; the trainer
+  now logs `ll_term` and `entropy_sum` separately. Sweep with
+  `--lv-entropy-betas` in [`run_experiments.py`](run_experiments.py). Selection
+  remains held-out AUC / LL, never the reweighted training objective.
+
+### Deferred (until entropy $\beta_H$ is settled)
+
+These stay out of the code on purpose:
+
+1. **Adjacency smoothness on $q$.** Pulling neighbouring neurons toward similar
+   posteriors is a homophily prior. FlyWire visual types are defined by partner
+   patterns, and residual GNNs over soft assignments already hurt Hungarian while
+   improving edge fit. Revisit only as a tiny negative-control if needed.
+2. **Nonlinear (MLP) block decoder.** Extra decoder capacity is the failure mode
+   of the removed $e_i$ / GNN arms. If block flexibility is revisited, prefer a
+   free $K\times K$ logit table over an MLP.
 
 ### Baselines kept for comparison
 
@@ -185,6 +203,20 @@ uv run python run_experiments.py \
   --epochs 40 --final-epochs 40 --final-seeds 0 1 2
 ```
 
+Entropy-weight ablation on the headline configuration
+(`d=512`, `lr=0.03`, unit-norm scale $16$):
+
+```bash
+uv run python run_experiments.py \
+  --device cuda --phase all --methods lv \
+  --lv-dims 512 --lv-lrs 0.03 \
+  --lv-bfs-fracs 1.0 --lv-likelihoods bernoulli \
+  --lv-u-norms unit --lv-u-scales fixed --lv-u-scale-inits 16.0 \
+  --lv-entropy-betas 0 0.1 0.3 1 3 \
+  --select-metric auc --grad-clip 1.0 \
+  --epochs 40 --final-epochs 40 --final-seeds 0 1 2
+```
+
 On Lightning (cheaper T4 is enough for LV):
 
 ```bash
@@ -192,8 +224,9 @@ export LIGHTNING_USERNAME=kc119 LIGHTNING_TEAMSPACE=vision-model
 # credentials: source ~/.ortet/lightning.env   # or equivalent
 uv run python launch_lightning_sweep.py \
   --machine T4 --methods lv \
-  --lv-dims 64 128 256 --lv-lrs 0.003 0.01 0.03 \
-  --lv-u-norms unit --lv-u-scales fixed --lv-u-scale-inits 12.0 16.0 \
+  --lv-dims 512 --lv-lrs 0.03 \
+  --lv-u-norms unit --lv-u-scales fixed --lv-u-scale-inits 16.0 \
+  --lv-entropy-betas 0 0.1 0.3 1 3 \
   --lv-likelihoods bernoulli --lv-bfs-fracs 1.0 \
   --select-metric auc --grad-clip 1.0 \
   --epochs 40 --final-epochs 40 --final-seeds 0 1 2 \
