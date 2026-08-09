@@ -746,6 +746,7 @@ def main() -> None:
                 hp["bfs_frac"] = float(best["bfs_frac"])
                 hp["likelihood"] = str(best["likelihood"])
                 hp["label_smoothing"] = float(best.get("label_smoothing", 0.0))
+                hp["entropy_beta"] = float(best.get("entropy_beta", 1.0))
                 hp.update(u_norm_hyperparams(u_norm_of(best)))
                 if best.get("target_updates"):
                     # Carry the matched-compute budget so a selected control stays a
