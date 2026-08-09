@@ -1,0 +1,40 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.npz
+*.pkl
+*.npy
+*.pt
+*.csv
+!hp_results.csv
+!final_results.csv
+!final_summary.csv
+*.csv.gz
+*.meta.json
+hp_best.json
+hp_results.json
+final_results.json
+final_summary.json
+ntac_hp_best.json
+ntac_hp_results.json
+*.prentac.bak
+*.prelv.bak
+*.premerge.bak
+# Downloaded sweep artifacts, kept locally and merged into the canonical tables
+# rather than tracked. Broad enough to cover the numbered and dated variants
+# (gnn_sweep2_results/, gnn_sweep_results_20260809/), which a literal
+# "_sweep_results/" misses.
+*sweep*results*/
+heldout_pairs.npz
+heldout_rows.npz
+*_metrics.json
+
+*.png
+root_id_to_index_mapping.json
+uv.lock
+lightning_unsup_sweep.log
+*.log
+
+.ipynb_checkpoints/
+scratch/

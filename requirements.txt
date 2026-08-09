@@ -1,5 +1,10 @@
+# Prefer: uv sync / uv run (see pyproject.toml)
+numpy
 scipy
 pandas
-matplotlib
 scikit-learn
-seaborn
+torch
+tqdm
+ntac
+numba
+bottleneck

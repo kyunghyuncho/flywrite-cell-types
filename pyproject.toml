@@ -1,0 +1,27 @@
+[project]
+name = "flywrite-cell-types"
+version = "0.2.0"
+description = "Variational stochastic block models for FlyWire neuron clustering"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib",
+    "ntac>=0.1.2",
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "scipy",
+    "seaborn",
+    "torch",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["ruff"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
