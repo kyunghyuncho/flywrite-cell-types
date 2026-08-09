@@ -9,6 +9,47 @@ A detailed derivation of the single-hop low-rank vSBM appears in
 This repository additionally provides a **GNN-augmented** decoder that incorporates
 multi-hop soft assignment context.
 
+## Where the project stands
+
+Ground-truth agreement against the $729$ FlyWire visual types, on the
+$n_{\mathrm{shared}}=46\,479$ neurons that carry a label, under the unsupervised
+selection protocol described below. Hyperparameters are chosen by held-out
+Bernoulli log-likelihood; the ground-truth column is a report, never a selection
+criterion.
+
+| method | Hungarian (mean $\pm$ std) | fraction of $46\,479$ | ARI | NMI | seeds |
+| --- | --- | --- | --- | --- | --- |
+| Unseeded NTAC | $30\,654.5 \pm 24.7$ | $66.0\%$ | $0.676$ | $0.878$ | $2$ |
+| **LV vSBM, unit-norm decoder** | $\mathbf{24\,300.0 \pm 971.6}$ | $\mathbf{52.3\%}$ | $0.488$ | $0.822$ | $3$ |
+| LV vSBM, unconstrained decoder | $8\,459.7 \pm 354.1$ | $18.2\%$ | $0.177$ | $0.509$ | $3$ |
+| LV $+\,e$ | $5\,216.3 \pm 89.2$ | $11.2\%$ | $0.042$ | $0.373$ | $3$ |
+| LV vSBM, uniform minibatches | $2\,546.0 \pm 392.0$ | $5.5\%$ | $0.046$ | $0.224$ | $3$ |
+| PCA $+\,k$-means | $1\,355.0 \pm 88.8$ | $2.9\%$ | $0.008$ | $0.225$ | $3$ |
+| random $K=729$ assignment | $980.0 \pm 8.0$ | $2.1\%$ | $0.000$ | $0.202$ | $20$ |
+
+The three `LV vSBM` rows are the same model at three stages of this repository:
+uniform-random node minibatches, then breadth-first induced subgraphs
+(§ *Subgraph minibatches*), then a bounded block logit
+(§ *Bounding the block logit*). They are not otherwise matched — each row is the
+configuration its own sweep selected, so the width and learning rate move with the
+sampler and the constraint. The selected configuration is
+`d=256, lr=0.03, bernoulli, bfs_frac=1.0, --u-norm unit --u-scale fixed
+--u-scale-init 12`, $40$ epochs, seeds $0/1/2$; held-out AUC
+$0.9786/0.9793/0.9803$.
+
+Two caveats belong next to the headline rather than beneath it. Accuracy is
+**monotone decreasing in the learning rate** over the whole swept grid, and the
+selected $\mathrm{lr}=0.03$ is the *bottom* edge of that grid, so the optimum has
+almost certainly not been located. And the constraint that makes the run stable
+is not what buys most of the accuracy at that learning rate: the unconstrained
+control still reaches $21\,151$–$22\,451$ there
+(§ *The 40-epoch constraint sweep*).
+
+The GNN-augmented decoder is a **better edge model and a worse cell-type model**
+once it is stabilised, which is an unresolved methodological problem for a
+project that selects on held-out edge likelihood. See
+§ *The GNN wins the objective and loses the science*.
+
 ## Data
 
 Unfiltered FlyWire connections (data version 783):
@@ -102,6 +143,15 @@ case):
 | 0.25 | 74 | 3 289 | 243 357 | 0.09 |
 | 0.5 | 90 | 5 835 | 524 964 | 0.19 |
 | 1.0 | 226 | 11 318 | 2 557 158 | 0.95 |
+
+**What it bought.** Under the unsupervised protocol and three final seeds, the
+sampler alone took the LV model from Hungarian $2\,546.0\pm392.0$ to
+$8\,459.7\pm354.1$, a factor of $3.3$, before any change to the decoder. That
+comparison is not sampler-only, however: because an epoch is defined by coverage,
+the BFS arm also receives $\approx3.4\times$ more gradient updates per epoch. The
+matched-compute control is the clean measurement, and it moves the number much
+less — $2\,257$ against $4\,641$ in the five-epoch pilot — so the sampler helps
+beyond the extra steps, but not by the full factor.
 
 Because an epoch is defined by coverage rather than by a fixed batch count, its
 cost grows with `bfs_frac` ($66$ batches at $0$ versus $226$ at $1$), so the
@@ -224,8 +274,19 @@ heads, so deeper layers expand the receptive field without erasing 0-hop cluster
 identity. Learnable $\gamma$ is initialized at $0$, so training starts as pure LV and
 has to switch the GNN on; $\gamma$ is logged per epoch on a greppable `[gamma]` line.
 Unlike the $+e$ variants there is no free per-node residual table, so the only
-per-node parameter is $q_i$ and likelihood gains must be routed through the
-assignments.
+per-node parameter is $q_i$. That does **not** force likelihood gains through the
+assignments, as this README previously claimed: $h$ is built from $\alpha U$, but
+multi-hop mixing over $729$ clusters recovers enough neighbourhood-specific signal
+for the residual to explain edges on its own, which is measured in
+§ *The GNN wins the objective and loses the science*.
+
+**The residual needs its own bound.** `--u-norm unit` constrains the bilinear term
+only; the residual $\gamma\,(h_i\cdot h_j)$ is the half that was measured to
+diverge, and `--gnn-norm {none,unit}` is the constraint that bounds it
+(§ *Bounding the GNN residual*). `none` is the default and reproduces every run
+made before the flag existed, bit for bit; `unit` normalises the head outputs in
+the forward pass so that $\lvert\eta^{GNN}\rvert\le\lvert\gamma\rvert$. Any new
+GNN run should set it.
 
 The trainer shares the LV data path: square induced-subgraph minibatches from
 [`subgraph_sampler.SubgraphBatchSampler`](subgraph_sampler.py) with the same
@@ -272,11 +333,17 @@ Smoke / short run:
 uv run python gnn_vsbm.py --epochs 1 --max-updates 5 --minibatch 1024 --seed 0 --layers 2
 ```
 
-Longer training (defaults: $K=729$, $d=32$, $L=2$, `bfs_frac`$=0.5$):
+Longer training (defaults: $K=729$, $d=32$, $L=2$, `bfs_frac`$=0.5$,
+`--gnn-norm none`). The stabilised configuration is the second command:
 
 ```bash
 uv run python gnn_vsbm.py --epochs 20 --minibatch 2048 --lr 0.01 --bfs-frac 1.0 \
   --likelihood nb --seed 0 --out-prefix gnn
+
+uv run python gnn_vsbm.py --epochs 24 --minibatch 2048 --lr 0.1 --bfs-frac 1.0 \
+  --d 64 --layers 2 --likelihood bernoulli \
+  --u-norm unit --u-scale fixed --u-scale-init 8 --gnn-norm unit \
+  --seed 0 --out-prefix gnn
 ```
 
 ### PCA + $k$-means baseline
@@ -385,6 +452,13 @@ Hungarian ($\approx1.5$–$1.9\times10^{3}$ against $8.5\times10^{3}$ in the
 full-budget finals), so the finding needs confirmation at full budget; both
 numbers are now emitted by every run precisely so that confirmation is free.
 
+That confirmation has since been done, at $40$ epochs over $42$ configurations,
+and it survives in a weaker form: with the decoder no longer collapsing, the
+best-validation checkpoint is worse on ground truth than the last epoch in $35$ of
+$42$ runs, but by only $\approx1\%$ rather than $13$–$34\%$
+(§ *The 40-epoch constraint sweep*). Checkpoint restoration is a small systematic
+tax on a healthy run and a rescue on a collapsed one.
+
 ### Label smoothing: giving the decoder somewhere to stop
 
 Clipping bounds the *step*; it does not bound the *target* the step is walking
@@ -473,7 +547,11 @@ which is enough — nothing survives past epoch $3$):
 
 **Smoothing does not prevent the collapse.** Every arm peaks at epoch $1$ (epoch
 $0$ at $\epsilon=10^{-1}$), is at chance by epoch $2$–$3$, and lands on the same
-saturated $\approx-6.47$ / AUC $\approx0.5$ as the unsmoothed run. Larger
+saturated $\approx-6.47$ / AUC $\approx0.5$ as the unsmoothed run. The three
+`base_rate` arms at $\epsilon\in\{0,10^{-3},10^{-2}\}$ agree on that final value
+to the precision reported here, which is the point rather than a coincidence:
+after saturation the reported number is a property of the clamp, not of the
+regulariser. Larger
 $\epsilon$ makes it *worse*, not better: $\epsilon=10^{-1}$ collapses a full
 epoch earlier and loses $27\%$ of the best-checkpoint Hungarian. The tighter
 symmetric ceiling of the `uniform` arm buys one extra healthy epoch — it is the
@@ -552,11 +630,15 @@ sparse ones. `--u-scale` chooses how $s$ is carried, `--u-scale-init` sets it:
 | `learned` | one, as $\log s$, so $s>0$ by construction | $s_T$, whatever the run ends at |
 | `per_row` | $K$, as $\log s_k$ | $\max_k s_k$ — one runaway row suffices |
 
-The default $s_0=8$ follows from the arithmetic of the graph rather than from
+The flag default $s_0=8$ follows from the arithmetic of the graph rather than from
 taste. The bias carries the base rate, $b\approx-8.8$; a block of density $0.1$
 sits at $\eta\approx-2.2$, i.e. $+6.6$ above $b$. Eight logits of travel span
 the range the data occupy while capping $|\eta|$ near $17$, two orders of
-magnitude below what the unconstrained decoder reached.
+magnitude below what the unconstrained decoder reached. At a $40$-epoch budget
+this turns out to be slightly too tight — $s=12$ wins and $s=8$ pulls the bias
+away from the base rate to compensate — so `--u-scale-init 12` is the value to
+use, and $8$ remains the flag default only because it is what every earlier run
+was made with.
 
 **Does it keep $\mathrm{lr}=0.1$ trainable?** Four arms, identical configuration
 to the collapse above ($d=256$, $\mathrm{lr}=0.1$, Bernoulli, `bfs_frac`$=1$,
@@ -583,7 +665,9 @@ spends most of its allowance.
 to $11.01$ by epoch $11$ — a factor of $1.4$ from its initialisation over a run
 in which the unconstrained embeddings grew by a factor of $200$. It does not
 relocate the divergence. That it settles slightly above $8$ is mild evidence
-that $s_0=8$ is a reasonable, marginally conservative default.
+that $s_0=8$ is conservative; at $40$ epochs it goes further, to $\approx14.4$,
+and $s=12$ is what the confirmation sweep selected
+(§ *The 40-epoch constraint sweep*).
 
 **`per_row` fits best and guarantees least, exactly as its bound predicts.** It
 takes the best numbers in the table, but its ceiling is $\max_k s_k$, and that
@@ -649,8 +733,9 @@ rather than asserted. Commit `8bbdd47`, commit `e4604be` and the working tree at
 `--u-norm none`, run over an identical budget, produce bit-identical assignment,
 score and assignment-dict arrays (matching SHA-256) and identical `val_metric`,
 `val_auc` and `max_abs_train_logit` to the last digit, for all three trainers.
-The full $12$-epoch control arm reproduces `scratch/ls/d256_eps0.log` exactly,
-down to the frozen $3\,036.008$ and the final `val_ll` $=-6.486398$.
+The full $12$-epoch control arm reproduces the $\epsilon=0$ row of the smoothing
+table above exactly, down to the frozen $\max\lvert\eta\rvert=3\,036.008$ and the
+final `val_ll` $=-6.486398$.
 
 Every run records `u_norm`, `u_scale`, `u_scale_init`, the realised scale at both
 the reported checkpoint and the last epoch (`u_scale_value`,
@@ -664,14 +749,19 @@ and worth stating explicitly: `train_lv_e.py` adds $e_i\cdot e_j$ and
 `gnn_vsbm.py` adds $\gamma\,(h_i\cdot h_j)$, neither of which is normalised, so
 `--u-norm unit` bounds the cluster term alone.
 
-**Recommendation.** Prefer `unit` with `fixed` at $s_0=8$. It matches the
+**Recommendation (twelve-epoch evidence; revised below).** Prefer `unit` with
+`fixed`. It matches the
 learned scalar on every metric, has no parameter that can drift, and is the only
 arm whose ceiling is guaranteed for the whole run rather than merely observed
 after it. Use `learned` as the diagnostic that reports whether $s_0$ was badly
-chosen. `per_row` is the strongest fit here and may be worth revisiting at
+chosen. `per_row` is the strongest fit *here* and may be worth revisiting at
 longer budgets, but it should not be the default: its ceiling of $\max_k s_k$
 already ran to twice the mean within twelve epochs, which is the beginning of
-the behaviour the whole change exists to prevent. Because normalisation, not
+the behaviour the whole change exists to prevent. The $40$-epoch sweep below
+overturns two of the quantitative conclusions of this twelve-epoch pilot — the
+best scale is $12$ rather than $8$, and $\mathrm{lr}=0.1$ is not the optimum at
+all — while leaving the qualitative ranking of the three parameterisations
+intact. Because normalisation, not
 smoothing, is what makes
 $\mathrm{lr}=0.1$ trainable, the two axes should be swept in that order:
 
@@ -683,8 +773,167 @@ which is $5$ arms per remaining grid point ($1$ unconstrained $+\,2\times2$),
 the unconstrained arm retaining the historical run names so accumulated
 artefacts and `--skip-existing` stay valid.
 
-Current LV grids fix the learning rate at the previously selected optimum and
-spend the budget on the likelihood and the rank $d$. A pilot at $5$ epochs
+### The 40-epoch constraint sweep
+
+The pilot above ran twelve epochs at a single width and learning rate. The
+confirmation sweep ran $42$ hyperparameter configurations at $40$ epochs on an
+L4, followed by three-seed finals at the selected configuration
+($\approx6$ h $10$ m wall clock):
+
+```bash
+uv run python launch_lightning_sweep.py \
+  --machine L4 --methods lv \
+  --lv-dims 64 256 --lv-lrs 0.03 0.1 0.3 --lv-bfs-fracs 1.0 \
+  --lv-likelihoods bernoulli \
+  --lv-u-norms none unit --lv-u-scales fixed learned per_row \
+  --lv-u-scale-inits 8.0 12.0 \
+  --grad-clip 1.0 --epochs 40 --final-epochs 40 --final-seeds 0 1 2 \
+  --detach-only --remote-stop-after
+```
+
+The arms are the unconstrained control plus
+$\{$`fixed`, `learned`, `per_row`$\}\times\{8,12\}$; because
+`run_experiments.py` takes the full `u_scales` $\times$ `u_scale_inits` product,
+`learned@12` and `per_row@12` come along at no design cost, and they carry the
+clearest evidence against `per_row`. Selection was on held-out Bernoulli
+log-likelihood, as always. The held-out split on the remote machine was verified
+byte-identical (SHA-256) to the local `heldout_pairs.npz` / `heldout_rows.npz`,
+so `val_metric` is comparable with every historical run.
+
+**The learning rate, not the constraint, is what binds.** Hungarian at the
+reported checkpoint, averaged over the two widths:
+
+| arm | $\mathrm{lr}=0.03$ | $\mathrm{lr}=0.1$ | $\mathrm{lr}=0.3$ |
+| --- | --- | --- | --- |
+| `none` | $21\,801$ | $5\,145$ | $1\,550$ |
+| `unit fixed` $12$ | $\mathbf{24\,047}$ | $16\,335$ | $5\,178$ |
+| `unit fixed` $8$ | $22\,956$ | $14\,766$ | $5\,603$ |
+| `unit learned` $12$ | $22\,082$ | $16\,578$ | $7\,795$ |
+| `unit learned` $8$ | $21\,554$ | $15\,174$ | $7\,686$ |
+| `unit per_row` $12$ | $22\,634$ | $17\,094$ | $7\,220$ |
+| `unit per_row` $8$ | $23\,334$ | $15\,888$ | $6\,242$ |
+
+Accuracy is monotone decreasing in $\mathrm{lr}$ under *every* arm, and
+$\mathrm{lr}=0.03$ is the bottom edge of the grid. The premise that motivated
+sweeping upward — that $\mathrm{lr}=0.1$ with the constraint beat everything —
+was an artefact of the twelve-epoch pilot budget: at $40$ epochs
+$\mathrm{lr}=0.03$ dominates $\mathrm{lr}=0.1$ by $\approx7\,000$ Hungarian. The
+next sweep should go **down**, to $\mathrm{lr}\in\{0.01,0.003\}$, which are
+unexplored.
+
+**The constraint's benefit grows with the learning rate rather than being
+essential at the optimum.** At $\mathrm{lr}=0.03$ the unconstrained control
+survives all $40$ epochs and scores $22\,451$ ($d=64$) and $21\,151$ ($d=256$),
+only $\approx1\,500$–$2\,500$ below the best constrained arm. It is at
+$\mathrm{lr}=0.1$ that it collapses ($7\,922$ at $d=64$, $2\,368$ at $d=256$)
+and at $\mathrm{lr}=0.3$ that it is destroyed ($2\,120$ and $979$). The honest
+statement is therefore that the constraint buys robustness across learning
+rates — and the guarantee — rather than the headline accuracy.
+
+Two things about the collapse are worth recording. The unconstrained peak
+$\max\lvert\eta\rvert$ rises with both $\mathrm{lr}$ and $d$
+($39.6$ and $194.5$ at $\mathrm{lr}=0.03$; $910.6$ and $2\,175.5$ at
+$\mathrm{lr}=0.1$; $4\,204.8$ at $d=64$, $\mathrm{lr}=0.3$), and once saturation
+occurs the parameters freeze *exactly*: `max_abs_logit` is bit-identical from the
+collapse epoch onward, which is the signature of every gradient being exactly
+zero rather than merely small. Two of the four collapsed runs
+($d=64$ at $\mathrm{lr}=0.3$ and $d=256$ at $\mathrm{lr}=0.1$, i.e. different
+widths and different learning rates) land on the *same* final held-out
+likelihood to every digit, $-6.486399412155151$, at AUC exactly $0.5$: once the
+sigmoid saturates, what the run reports no longer depends on the run.
+
+**`per_row` is not a real constraint.** Its ceiling is $\max_k s_k$, and at
+$\mathrm{lr}=0.3$ that ceiling is not respected in any useful sense:
+$\max\lvert\eta\rvert$ reaches $1\,567$ at $d=64$ and $6\,690$ at $d=256$ from an
+initialisation of $8$, with the realised $\max_k s_k$ running to $28$–$38$ there
+and to $34$–$45$ at $\mathrm{lr}=0.1$, while the mean scale stays at $9$–$19$
+throughout. A minority of rows escapes. Even at the
+benign $\mathrm{lr}=0.03$ the realised $\max_k s_k$ reaches $22.5$–$23.9$ against
+initialisations of $8$ and $12$; there $\max\lvert\eta\rvert$ still sits at
+$17.8$–$22.3$, so the run is healthy, but the bound the construction exists to
+provide has already been forfeited. `fixed` has one by construction; `learned`
+has one conditional on a scale that in fact stays bounded.
+
+**The learned scale wants a larger $s$ than the grid contained.** At
+$\mathrm{lr}=0.03$ and $40$ epochs it converges to $14.25$–$14.55$ independent of
+both width and initialisation ($8$ or $12$), against $\approx11$ at twelve
+epochs — i.e. it is still creeping upward with the budget. At higher learning
+rates it settles lower ($11.7$–$12.6$ at $\mathrm{lr}=0.1$, $10.0$–$13.1$ at
+$\mathrm{lr}=0.3$). Since the best *fixed* scale is $12$ and the learned scale
+wants $\approx14.4$, a fixed $s\in[14,16]$ is untested, promising, and one cheap
+run.
+
+**The bias confirms this independently.** Under `fixed` $s=12$ it stays at
+$-8.504\pm0.194$ over six runs, close to $\log$ of the base rate,
+$\log(1.5\times10^{-4})=-8.80$. Under `fixed` $s=8$ it is pulled up to
+$-7.024\pm0.138$ — with only eight logits of travel the decoder buys headroom by
+moving the bias — which is independent evidence that $s=8$ is too tight, from a
+quantity the objective does not directly reward. Under `per_row` the bias drifts
+furthest ($-5.6$), consistent with its weakest guarantee.
+
+| arm | bias, mean $\pm$ std over $6$ runs |
+| --- | --- |
+| `unit fixed` $12$ | $-8.504 \pm 0.194$ |
+| `unit learned` $12$ | $-8.423 \pm 1.070$ |
+| `unit learned` $8$ | $-8.415 \pm 1.056$ |
+| `none` | $-8.050 \pm 1.385$ |
+| `unit fixed` $8$ | $-7.024 \pm 0.138$ |
+| `unit per_row` $12$ | $-5.643 \pm 1.906$ |
+| `unit per_row` $8$ | $-5.665 \pm 1.871$ |
+
+**Selection costs about $7\%$, systematically.** Held-out likelihood and ground
+truth disagree on the width and agree on the arm: the best log-likelihood is
+$d=256$, `unit fixed` $12$ (LL $-1.66558$, Hungarian $23\,208$), while the best
+Hungarian is $d=64$ at the same arm ($-1.68414$, $24\,886$). Across the whole
+grid the two rank configurations almost identically (Spearman
+$\rho=0.954$ over $42$ runs, $0.947$ over the $40$ non-collapsed ones), so
+held-out likelihood reliably separates *regimes*. Within the winning regime it
+does not: $\rho=0.385$ ($p=0.18$) over the $14$ runs at $\mathrm{lr}=0.03$. The
+protocol therefore forfeits $\approx1\,700$ Hungarian here, which is inside the
+seed spread ($\pm972$) but systematic in sign.
+
+**Restoring the best checkpoint is now a small tax rather than a rescue.** In
+$35$ of $42$ HP runs the best-validation checkpoint scores *worse* on ground
+truth than the last epoch, by $230$ Hungarian on average — about $1\%$ of the
+$\approx23\,000$ typical value. The two large positive deltas ($+977$, $+1\,377$)
+occur only in collapsed unconstrained runs, where restoring the checkpoint is
+obviously right. In the finals it is $2$ of $3$ and $-184$ ($24\,300$ against
+$24\,484$). The model is still improving on ground truth after held-out
+likelihood has peaked, which is the same "still improving at the end of the
+budget" signal the pilot saw and a further reason to read the `last_*` columns.
+
+**Multi-seed finals.** `d=256, lr=0.03, bernoulli, bfs_frac=1.0, unit/fixed,
+s=12, grad-clip 1.0, label_smoothing 0`, $40$ epochs, seeds $0/1/2$:
+
+| quantity | mean $\pm$ std | fraction of $46\,479$ |
+| --- | --- | --- |
+| Hungarian | $24\,300.0 \pm 971.6$ | $52.3\%$ |
+| ARI | $0.4879 \pm 0.0413$ | |
+| NMI | $0.8222 \pm 0.0068$ | |
+| last-epoch Hungarian | $24\,483.7 \pm 770.3$ | $52.7\%$ |
+
+Per seed: $23\,208$ / $24\,623$ / $25\,069$; held-out LL $-1.6656$ / $-1.6616$ /
+$-1.6284$; held-out AUC $0.9786$ / $0.9793$ / $0.9803$; bias $-8.421$ / $-8.479$
+/ $-8.478$. The latent-variable model has gone from $28\%$ of NTAC to $79\%$ of
+it, and the remaining gap from NTAC to the attainable maximum ($34\%$) is now
+larger than the gap from this model to NTAC ($14\%$).
+
+**Not run, and worth running next**, in priority order: $\mathrm{lr}\in\{0.01,
+0.003\}$ at `unit/fixed` $12$, since the optimum is at the grid edge; fixed
+$s\in\{14,16\}$; then `bernoulli` against `nb` at whatever wins. The
+`{bernoulli, nb}` follow-up at the selected configuration was deliberately not
+launched, because `remote_start_unsup_sweep.sh` begins with `rm -f hp_* final_*`
+and another sweep was in flight on the same Studio.
+
+### Default grids
+
+What follows describes the grids `run_experiments.py` and
+`launch_lightning_sweep.py` sweep when no axis is given on the command line. Every
+sweep reported above overrode them explicitly, and the commands are recorded with
+their results; these defaults are the fallback, not the record.
+
+The default LV grid fixes the learning rate at the previously selected optimum and
+spends the budget on the likelihood and the rank $d$. A pilot at $5$ epochs
 established that `bfs_frac` is not worth a grid axis — Hungarian $1\,228$ at $0$,
 $1\,644$ at $0.5$, $4\,641$ at $1$ — so the sampler is pinned at
 `bfs_frac`$=1$ and $d$ is swept instead, on the reasoning that once data exposure
@@ -710,20 +959,217 @@ $L\in\{0,1,2\}$,
 $d\in\{32,64\}$, $d_e{=}16$, $\mathrm{lr}\in\{0.005,0.01\}$, $e_{\mathrm{wd}}{=}10^{-2}$.
 NTAC defaults: $K{=}729$, $R{=}12$, $T{=}0.1$ (paper).
 
-Lean GNN-vSBM grid (`--methods gnn`), sized by the subgraph-local per-step cost,
-which is within $\approx 1.2\times$ of LV:
+Recommended — rather than default — GNN-vSBM grid (`--methods gnn`), sized by the
+subgraph-local per-step cost, which is within $\approx 1.2\times$ of LV:
 
 ```bash
---gnn-layers 0 1 2 4 --gnn-dims 64 --gnn-lrs 0.01 0.05 \
---gnn-bfs-fracs 1.0 --gnn-likelihoods bernoulli poisson nb
+--gnn-layers 0 1 2 4 --gnn-dims 64 --gnn-lrs 0.05 0.1 \
+--gnn-bfs-fracs 1.0 --gnn-likelihoods bernoulli \
+--gnn-u-norms unit --gnn-u-scales fixed --gnn-u-scale-inits 8.0 \
+--gnn-norms unit --gnn-final-layers 0 2 --epochs 24 --final-epochs 24
 ```
 
-$4\times1\times2\times1\times3=24$ HP runs plus $3$ multi-seed finals. `bfs_frac`
-is pinned at $1$ because a subgraph-local GNN needs a non-degenerate block
-(above); $d$ is pinned at the LV optimum because $L$ and the likelihood are the
-two axes specific to this model; $L{=}0$ is the in-code LV control (JK over hop
-$0$ only); and $\mathrm{lr}$ is swept because at $\mathrm{lr}=0.01$ the learned
-$\gamma$ stays near $10^{-2}$ after three epochs, i.e. the GNN barely switches on.
+`bfs_frac` is pinned at $1$ because a subgraph-local GNN needs a non-degenerate
+block (above); $d$ is pinned at the LV optimum because $L$ and the likelihood are
+the two axes specific to this model; and $L{=}0$ is the in-code LV control (JK
+over hop $0$ only). Three things changed relative to the earlier grid, all of
+them consequences of the diagnosis in the next section: `--gnn-norms unit` is now
+mandatory rather than optional, the learning rate moved *up* to $\{0.05,0.1\}$
+because the diverging quantity — not the step size — was what limited it, and
+`--gnn-final-layers` retrains extra depths in the multi-seed finals so that the
+depth-versus-ground-truth comparison is a multi-seed statement rather than a
+single run per depth. The earlier grid's stated reason for sweeping the learning
+rate — "at $\mathrm{lr}=0.01$ the learned $\gamma$ stays near $10^{-2}$, i.e. the
+GNN barely switches on" — was a misreading, corrected below.
+
+### Bounding the GNN residual: `--gnn-norm`
+
+The block logit of [`gnn_vsbm.py`](gnn_vsbm.py) is a sum of two terms,
+
+$$
+\eta_{ij} = \underbrace{(\alpha_i U_s)^\top(\alpha_j U_t) + b}_{\eta^{LV}_{ij}}
++ \underbrace{\gamma\,h_i^\top h_j}_{\eta^{GNN}_{ij}},
+$$
+
+and `--u-norm unit` bounds only the first: `prototypes()` is called from all three
+decoder call sites, so $\lvert\eta^{LV}_{ij}-b\rvert\le s$ holds structurally at
+the subgraph block, the full-propagation block and the held-out pair path.
+Neither $\gamma$, nor `jk_proj`, nor the two heads are constrained, so the
+residual is free. `block_terms` now returns the two halves separately and the
+per-epoch line reports `max_abs_lv` and `max_abs_residual` next to
+`max_abs_logit`, which is what turns the following into a measurement.
+
+**The diverging quantity is the residual, not the term the existing constraint
+bounds.** A $2\times2$ attribution (propagation $\times$ `u_norm`) at $L=2$,
+$d=64$, $\mathrm{lr}=0.01$, $12$ epochs $\times$ $113$ updates:
+
+| propagation | `u_norm` | val LL | val AUC | Hungarian | $\gamma$ | $\max\lvert\eta^{LV}\rvert$ | $\max\lvert\eta^{GNN}\rvert$ | wall |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| subgraph | `none` | $-1.603$ | $0.738$ | $2\,470$ | $-0.003$ | $10.9$ | $105.6$ | $520$ s |
+| subgraph | `unit` $8$ | $-0.587$ | $0.751$ | $3\,033$ | $-0.002$ | $12.1$ | $301.1$ | $512$ s |
+| full | `none` | $-0.613$ | $0.729$ | $1\,924$ | $0.005$ | $9.2$ | $166.5$ | $2\,112$ s |
+| full | `unit` $8$ | $-0.859$ | $0.754$ | $3\,519$ | $-0.002$ | $12.6$ | $259.5$ | $2\,231$ s |
+
+$\max\lvert\eta^{LV}\rvert$ never leaves $[6,13]$ in *any* cell, including the
+unconstrained ones — the bilinear half was simply not the problem here — while the
+residual reaches $105$–$301$, the held-out likelihood oscillates by an order of
+magnitude between epochs, and AUC never trends. With `--u-norm unit` alone at
+$\mathrm{lr}=0.1$ the run reports $\max\lvert\eta\rvert=1.057\times10^{9}$ — which
+is the residual to within the $\lvert b\rvert+s\approx21$ the constraint allows the
+bilinear half — at AUC $0.397$. (`scratch/gnn_2x2/FINDINGS.md` records this as
+$1.06\times10^{15}$; the run's own log and metrics file give
+$1\,057\,084\,672$, i.e. $10^{9}$, and that is the peak over all twelve epochs.)
+
+**Subgraph-local propagation is exonerated.** Full-graph propagation reproduces
+the failure identically — residual to $166$–$260$, oscillating `val_ll`, flat AUC,
+$\gamma\approx10^{-3}$ — at $1.53$ s/step against $0.354$ s/step, a factor $4.3$
+on this host. It buys nothing, so `--propagation subgraph` remains the default.
+
+**`--gnn-norm unit`** normalises the two head outputs to unit rows in the forward
+pass, so the residual is a cosine similarity with a learnable amplitude,
+
+$$
+\eta^{GNN}_{ij} = \gamma\,\hat h_i^\top \hat h_j, \qquad
+\lvert\eta^{GNN}_{ij}\rvert \le \lvert\gamma\rvert .
+$$
+
+At $L=2$, $\mathrm{lr}=0.01$, same $1\,356$-update budget:
+
+| arm | val LL | val AUC | Hungarian | $\gamma$ | $\max\lvert\eta^{GNN}\rvert$ |
+| --- | --- | --- | --- | --- | --- |
+| `u_norm none`, `gnn_norm none` | $-1.603$ | $0.738$ | $2\,470$ | $-0.003$ | $105.6$ |
+| `u_norm unit`, `gnn_norm none` | $-0.587$ | $0.751$ | $3\,033$ | $-0.002$ | $301.1$ |
+| `u_norm none`, `gnn_norm unit` | $-1.664$ | $\mathbf{0.9665}$ | $3\,125$ | $-7.55$ | $7.54$ |
+| `u_norm unit`, `gnn_norm unit` | $-1.640$ | $\mathbf{0.9656}$ | $2\,555$ | $7.60$ | $7.58$ |
+
+Both `gnn_norm unit` arms improve *monotonically* in AUC and held-out likelihood
+for all twelve epochs ($0.688\to0.967$, $-2.81\to-1.66$) with no oscillation, and
+$\max\lvert\eta\rvert$ grows steadily from $9$ to $18$ while they fit — a decoder
+walking towards a finite optimum rather than either exploding or sitting still.
+Across the runs with the residual bounded, held-out AUC reaches $0.966$–$0.985$.
+Note that `--u-norm` is nearly irrelevant once the residual is bounded at
+$\mathrm{lr}=0.01$; it matters at $\mathrm{lr}=0.1$, where the bilinear term does
+start to move.
+
+**$\gamma$ was never asleep.** Reading $\gamma\approx10^{-3}$ as "the GNN is being
+ignored" was wrong: the residual is a *product*, and with the heads unconstrained
+the optimiser satisfies the data by growing $\lVert h\rVert$ instead of $\gamma$.
+The unconstrained $L=2$ run reaches $\lvert\eta^{GNN}\rvert=106$ at
+$\gamma=-0.003$, i.e. $\lVert h\rVert\sim200$. Only under `--gnn-norm unit` does
+$\gamma$ measure the residual's contribution, and it then wakes up decisively:
+$-0.71,-1.48,-2.40,\ldots,-7.55$ over twelve epochs at $\mathrm{lr}=0.01$, and
+$\pm17$ to $\pm30$ at $\mathrm{lr}=0.1$, still growing at the last epoch in every
+case.
+
+One residual risk for long runs: the total bound is
+$\lvert\eta\rvert\le\lvert b\rvert+s+\lvert\gamma\rvert$ and **both $b$ and
+$\gamma$ are free**. Observed totals reach $\max\lvert\eta\rvert=47$ at $12$
+epochs and $57$ at $24$, comfortably short of float32 saturation but growing
+throughout, so `max_abs_logit` and the `[decoder] bias` line are worth watching in
+anything longer than $\approx30$ epochs.
+
+#### The GNN wins the objective and loses the science
+
+This is the open problem of the project, and it is a problem with the *selection
+criterion*, not with tuning. Matched to the constrained LV reference at
+$\mathrm{lr}=0.1$, $d=64$, `--u-norm unit --u-scale fixed --u-scale-init 8
+--gnn-norm unit`, $12$ epochs of full coverage:
+
+| arm | $L$ | epochs | val LL | val AUC | Hungarian | NMI | ARI | $\gamma$ | bias |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| constrained LV (reference) | – | $12$ | $-2.061$ | $0.9444$ | $12\,317$ | $0.598$ | $0.210$ | – | $-7.48$ |
+| GNN, seed $0$ | $0$ | $12$ | $-1.730$ | $0.9672$ | $11\,440$ | $0.531$ | $0.180$ | $-4.17$ | $-6.69$ |
+| GNN, seed $1$ | $0$ | $12$ | $-1.716$ | $0.9697$ | $13\,248$ | $0.561$ | $0.208$ | $5.07$ | $-7.78$ |
+| GNN, seed $0$ | $1$ | $12$ | $-1.402$ | $0.9742$ | $6\,177$ | $0.404$ | $0.061$ | $-17.28$ | $-17.06$ |
+| GNN, seed $0$ | $2$ | $12$ | $-1.321$ | $0.9802$ | $6\,028$ | $0.421$ | $0.056$ | $20.83$ | $-21.20$ |
+| GNN, seed $1$ | $2$ | $12$ | $-1.376$ | $0.9730$ | $6\,807$ | $0.444$ | $0.073$ | $16.78$ | $-18.01$ |
+| GNN, seed $0$ | $4$ | $12$ | $-1.062$ | $0.9798$ | $4\,548$ | $0.375$ | $0.038$ | $19.97$ | $-20.31$ |
+| GNN, seed $0$ | $0$ | $24$ | $-1.618$ | $0.9749$ | $\mathbf{15\,038}$ | $0.598$ | $0.259$ | $-8.08$ | $-8.71$ |
+| GNN, seed $0$ | $2$ | $24$ | $-1.158$ | $0.9845$ | $6\,757$ | $0.442$ | $0.067$ | $26.34$ | $-24.97$ |
+
+Held-out likelihood and AUC improve monotonically with depth
+($-1.73\to-1.40\to-1.32$; AUC $0.967\to0.974\to0.980$) while ground-truth
+agreement collapses monotonically with depth, by roughly a factor two, on all
+three measures. The ordering holds at both seeds with a wide margin: $L=0$ gives
+$11.4$–$13.2$k, $L=2$ gives $6.0$–$6.8$k. It is not a stopping artefact —
+doubling the budget to $24$ epochs moves both arms along their own trajectories
+and leaves the ratio unchanged at $2.2\times$, with $L=0$ reaching Hungarian
+$15\,038$, the best agreement any GNN run has recorded here.
+
+The mechanism is visible in the decoder bias. At $L=0$ it stays near $\log$ base
+rate ($-6.7$ to $-8.7$); at $L\ge1$ it is driven to $-17$ to $-25$ to make room
+for a residual worth $\pm21$ logits. **The residual, not the cluster assignment,
+is carrying the edge model.** The module docstring's claim that gains "have to be
+routed through the assignments" because there is no per-node residual table is
+too strong: $h$ is built from $\alpha U$, but multi-hop mixing over $729$
+clusters at $d=64$ recovers enough neighbourhood-specific signal to explain edges
+without the assignments having to mean anything.
+
+Since this project selects on held-out Bernoulli log-likelihood, **a sweep that
+maximises `val_metric` will now systematically prefer the arm that recovers cell
+types least well.** Nothing in the repository currently resolves this. Three
+partial responses are available and none is a fix: report `--gnn-final-layers`
+so each depth is summarised on its own rather than only the selected one; read
+the Spearman $\rho$ between `val_metric` and `gt_hungarian` that the inspection
+notebook prints, which makes the disagreement explicit; and, if the goal is cell
+types rather than edge prediction, restrict the model to $L=0$ and treat $L>0$ as
+a separate question about edge likelihood. A principled selection criterion that
+is unsupervised *and* prefers assignment-carried structure is an open question.
+
+**Status of the evidence.** The tables above are single runs (two seeds where
+stated) from a local CPU-only $2\times2$ study at $d=64$, deliberately cheap. A
+multi-seed remote sweep over depth $\times$ learning rate with the residual bound
+active is in flight at the time of writing; its numbers are not yet available and
+will supersede these. The earlier remote GNN sweep was **aborted**: its $20$
+rescued metric files (`gnn_sweep_results/`) predate `--gnn-norm`, and every arm
+with $L>0$ diverged there, as did $L=0$ at $\mathrm{lr}=0.05$ — only $L=0$ at
+$\mathrm{lr}=0.01$ survived, at AUC $0.937$–$0.943$. Those files are retained as a
+historical record and are not merged into the canonical tables.
+
+#### Scale parameterisation under the residual bound
+
+At $L=2$, $\mathrm{lr}=0.1$, $12$ epochs, `--gnn-norm unit`:
+
+| `u_scale` | val LL | val AUC | Hungarian | realised $\max_k s_k$ | $\max\lvert\eta^{LV}\rvert$ |
+| --- | --- | --- | --- | --- | --- |
+| `fixed` $8$ | $-1.321$ | $0.9802$ | $6\,028$ | $8.00$ | $27.5$ |
+| `learned` $8$ | $-1.283$ | $0.9825$ | $6\,285$ | $11.92$ | $29.4$ |
+| `per_row` $8$ | $-1.348$ | $0.9810$ | $4\,637$ | $40.19$ | $53.1$ |
+
+`per_row` behaves exactly as its weaker guarantee predicts — one row reaches
+$s=40$ — and is the worst on ground truth, reproducing the LV verdict on a
+different model. On learning rate at `fixed` $8$: $\mathrm{lr}=0.05$ gives
+$-1.223$ / $0.9848$ / $5\,289$ against $\mathrm{lr}=0.1$'s $-1.321$ / $0.9802$ /
+$6\,028$ — better likelihood, worse Hungarian, the same trade-off once more.
+
+#### A device-move bug that would have frozen the learned scale on CUDA
+
+Worth recording because it was silent on CPU and fatal on exactly the accelerator
+a remote sweep uses. `make_block_scale(..., "cpu")` builds the scale parameter on
+the host, `GNNvSBM.__init__` registers it as `self.u_log_scale`, and `train()`
+then calls `.to(device)`. `nn.Module._apply` mutates a parameter in place only
+when the conversion is shallow-copy compatible; a device change installs a **new**
+`Parameter` in `_parameters` and leaves `BlockScale.log_scale` pointing at the old
+host tensor. The forward pass would then read a tensor the optimiser never
+updates, so `--u-scale learned` and `--u-scale per_row` would have been frozen at
+their initial values on CUDA while `named_parameters` — hence the optimiser and
+the checkpoint — tracked the device copy. Fixed by rebinding in `GNNvSBM._apply`;
+`scratch/gnn_2x2/wiring_checks.py` reproduces the failure on CPU by forcing the
+same code path with
+`torch.__future__.set_overwrite_module_params_on_conversion(True)` and asserts the
+identity afterwards. The two LV trainers were checked and do **not** share the
+defect: they call `make_block_scale(..., device)` with the target device, so the
+parameter is never moved after registration.
+
+**`--u-norm none --gnn-norm none` is a bit-for-bit no-op.** The pre-constraint
+baseline, the branch head and the working tree agree on all $35$ shared metric
+keys *and* on the full $134\,181$-element assignment vector, under both
+`--propagation subgraph` and `--propagation full`. One methodological caveat
+established rather than assumed: this host's float reductions are load-dependent,
+so two runs of the *same* build diverge in the fifth significant figure of the
+epoch-$0$ loss when the machine is busy, and the divergence amplifies over
+epochs. Exactness claims are only checkable with `OMP_NUM_THREADS=1` on a
+quiescent machine, which is how those comparisons were made.
 
 
 ## End-to-end workflow
@@ -764,21 +1210,66 @@ The notebook expects `hp_results.csv`, `hp_best.json`, `final_results.csv`, and
 `final_summary.csv` in the working directory. Selection metrics are method-specific
 (held-out Bernoulli LL, negated row MSE, negated mean Jaccard cost), so `val_metric`
 is only ever plotted on per-method axes; only Hungarian / ARI / NMI are comparable
-across methods.
+across methods. It reads the per-run `*_metrics.json` files as well, for the
+columns the aggregated tables do not carry, and every panel degrades to a printed
+note when its columns are absent, so the same notebook serves a PCA-only and a
+full sweep. Sections, in order:
 
-#### Recovering an interrupted sweep
+1. **Hyperparameter search.** Per-method leaderboards; `val_metric` against
+   ground-truth Hungarian on per-method axes; held-out AUC against Hungarian;
+   the Spearman $\rho$ between the selection metric and Hungarian together with an
+   explicit `DISAGREE` flag when the two argmaxes differ; matched-compute
+   `bfs_frac=0` controls; the LV$+e$ residual axes.
+2. **The block-logit constraint.** Hungarian against learning rate split by
+   `u_norm`, which is the clearest single picture of the LV result; the realised
+   $\max\lvert\eta\rvert$ per arm on a log axis against the float32 saturation
+   threshold, which is where the decoder collapse is visible at all; the realised
+   scale against its initialisation, separating `fixed` / `learned` / `per_row`;
+   the decoder bias against $\log$ base rate; the best-checkpoint versus
+   last-epoch ground-truth gap; label smoothing when a sweep varied it; and the
+   per-epoch $\max\lvert\eta\rvert$ trajectories parsed out of a sweep log when
+   one is present.
+3. **Multi-seed finals.** Per-seed tables and the cross-method comparison as a
+   fraction of the theoretical Hungarian maximum, with the random-assignment
+   baseline and the maximum as reference lines. Grouped finals
+   (`--gnn-final-layers`) are plotted per group rather than pooled into their
+   method.
 
-If a remote sweep is cut short after the HP phase, the finals rows can be
-reconstructed offline from the saved assignment dictionaries — the ground-truth
-metrics are a cheap CPU computation and do not require retraining. For the
-NTAC-only sweep (whose artifacts were retrieved with an `ntac_` prefix):
+#### Merging a downloaded sweep into the canonical tables
+
+Because `remote_start_unsup_sweep.sh` clears `hp_*` / `final_*` on the Studio
+before each sweep, the tables retrieved after a single-method run describe *only*
+that method, while the canonical tables in the repository root are the
+accumulation of every sweep so far. Downloading over them would silently discard
+the rest. [`merge_sweep_results.py`](merge_sweep_results.py) is the general
+solution: keep the download in its own directory and merge it *in*, replacing the
+methods the incoming sweep covers and carrying every other method over verbatim.
+
+```bash
+uv run python merge_sweep_results.py --source lv_sweep_results --dry-run
+uv run python merge_sweep_results.py --source lv_sweep_results  # *.premerge.bak
+```
+
+Replacement is per *method*, not per run name: a sweep re-selects its own
+hyperparameters, so its `hp_best`, its finals and its `final_summary` form one
+internally consistent statement, and splicing new rows into an older grid for the
+same method would leave a table whose selected configuration is not the one its
+finals were run at. The downloaded sweeps are kept under
+`lv_sweep_results/` and `gnn_sweep_results/`.
+
+[`merge_lv_results.py`](merge_lv_results.py) and
+[`merge_ntac_results.py`](merge_ntac_results.py) are the two earlier,
+sweep-specific versions of the same idea, retained because they solve a different
+problem: reconstructing the finals rows offline from saved assignment
+dictionaries when a remote sweep was cut short after the HP phase. The
+ground-truth metrics are a cheap CPU computation and do not require retraining.
 
 ```bash
 uv run python merge_ntac_results.py --dry-run   # inspect the planned merge
 uv run python merge_ntac_results.py             # write, backing up to *.prentac.bak
 ```
 
-The script recomputes Hungarian / ARI / NMI with `evaluate_clustering.evaluate_pair`,
+That script recomputes Hungarian / ARI / NMI with `evaluate_clustering.evaluate_pair`,
 takes the unsupervised `val_metric` from the surviving remote log, and merges the
 rows into `hp_results.*`, `hp_best.json`, `final_results.*`, and `final_summary.*`
 using the same sorted key-union schema as `run_experiments.py`. It is idempotent:
@@ -804,8 +1295,10 @@ Install the SDK once, and put API keys in `~/.ortet/lightning.env`
 > overwritten result set is worse than none) but it is unrecoverable: the Studio
 > is the only copy until the artifacts are pulled down. **Always download and
 > verify the previous sweep's artifacts before launching the next one**, then
-> merge them into the canonical tables with `merge_lv_results.py` /
-> `merge_ntac_results.py`.
+> merge them into the canonical tables with `merge_sweep_results.py`. This has
+> already come close to costing a sweep once: the optional `{bernoulli, nb}`
+> follow-up to the LV constraint sweep was abandoned because launching it would
+> have deleted another agent's in-flight GNN run on the same Studio.
 
 **1. Launch a detached sweep** (uploads code/data, starts `run_experiments.py` under
 `nohup`, returns immediately). By default the Studio **stops itself** when the job
@@ -834,26 +1327,36 @@ $\epsilon$ can be compared within one sweep; the run-name suffix `_ls<eps>` is
 emitted only for $\epsilon\neq0$, leaving every existing prefix — and therefore
 `--skip-existing` and the accumulated result tables — untouched.
 
-**LV rerun at a stable learning rate.** Given the divergence above, the LV arm is
-re-run at $\mathrm{lr}\in\{0.01,0.03\}$ across $d\in\{64,128,256\}$ — $d=64$
-included, since it diverges too, merely later (epoch $13$–$18$ rather than
-epoch $2$). Selection stays on the held-out Bernoulli log-likelihood; HP search
-and finals now use the same $40$-epoch budget so the selected model is the model
-that is evaluated:
+The decoder constraints are grid axes on the same footing. Each method takes
+`--{lv,lv-e,gnn}-u-norms`, `--...-u-scales` and `--...-u-scale-inits`; the GNN
+additionally takes `--gnn-norms {none,unit}` for the residual bound and
+`--gnn-final-layers` to retrain extra depths in the multi-seed finals beside the
+selected one, each summarised as its own group in `final_summary.*`. Every default
+is the historical value, so a sweep launched without these flags reproduces the
+runs that came before them.
+
+**Matched budgets.** HP search and finals use the same $40$-epoch budget, so the
+selected model is the model that is evaluated. Matching the two is what removes
+the selection inconsistency of choosing a configuration at $15$ epochs and
+reporting it at $40$, and it is the expensive part of the sweep.
+
+**The LV sweep that produced the current result** is given in § *The 40-epoch
+constraint sweep*. The next one should extend the learning rate downward, since
+the optimum sits at the bottom edge of the grid already swept:
 
 ```bash
 uv run python launch_lightning_sweep.py \
   --machine L4 --methods lv \
-  --lv-lrs 0.01 0.03 --lv-dims 64 128 256 \
-  --lv-likelihoods bernoulli poisson nb --lv-bfs-fracs 1.0 \
+  --lv-dims 64 256 --lv-lrs 0.003 0.01 --lv-bfs-fracs 1.0 \
+  --lv-likelihoods bernoulli \
+  --lv-u-norms unit --lv-u-scales fixed --lv-u-scale-inits 12.0 14.0 16.0 \
   --grad-clip 1.0 --epochs 40 --final-epochs 40 --final-seeds 0 1 2 \
   --detach-only --remote-stop-after
 ```
 
-That is $2\times3\times3=18$ HP runs plus $3$ multi-seed finals, all at $40$
-epochs. Matching the two budgets is what removes the selection inconsistency,
-and it is the expensive part; drop `--lv-likelihoods` to `bernoulli nb` if the
-budget is tight, since Poisson was the weakest arm at every width.
+That is $2\times2\times3=12$ HP runs plus $3$ finals, and it tests the two
+open questions at once: whether accuracy keeps rising as $\mathrm{lr}$ falls, and
+whether the fixed scale should follow the learned scale up towards $14$–$16$.
 
 **Auto-sleep.** The Studio ships with idle auto-sleep enabled at the platform
 default, and a detached `nohup` sweep does not reliably register as activity: an
