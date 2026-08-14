@@ -43,6 +43,7 @@ CODE_FILES = [
     "heldout.py",
     "subgraph_sampler.py",
     "training_utils.py",
+    "partner_consistency.py",
     "run_experiments.py",
     "evaluate_clustering.py",
     "index_mapping.py",
@@ -232,6 +233,13 @@ def main() -> None:
         help="LV entropy-weight grid on sum_i H(q_i); 1.0 is the uniform-prior ELBO",
     )
     parser.add_argument(
+        "--lv-partner-kl-weights",
+        type=float,
+        nargs="+",
+        default=[0.0],
+        help="LV partner-histogram KL weight grid; 0 disables the term",
+    )
+    parser.add_argument(
         "--label-smoothing-target",
         choices=LABEL_SMOOTHING_TARGETS,
         default="base_rate",
@@ -367,6 +375,7 @@ def main() -> None:
             f"--lv-u-scales {join_nums(args.lv_u_scales)} "
             f"--lv-u-scale-inits {join_nums(args.lv_u_scale_inits)} "
             f"--lv-entropy-betas {join_nums(args.lv_entropy_betas)} "
+            f"--lv-partner-kl-weights {join_nums(args.lv_partner_kl_weights)} "
             f"--lv-control-updates {args.lv_control_updates} "
             f"--ntac-max-ks {join_nums(args.ntac_max_ks)} "
             f"--ntac-max-iters {join_nums(args.ntac_max_iters)} "

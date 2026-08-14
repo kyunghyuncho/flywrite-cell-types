@@ -28,6 +28,7 @@ ntac_hp_results.json
 *sweep*results*/
 # Entropy-β ablation outputs (STATUS.txt, poller logs, per-run metrics); not source.
 entropy_beta_results/
+partner_kl_results/
 heldout_pairs.npz
 heldout_rows.npz
 *_metrics.json

@@ -38,6 +38,11 @@ expected complete log-likelihood (summed over kept pairs) plus
 added *mean* entropy, which underweighted the prior term by roughly the batch
 size; $\\beta_H=1$ is now the standard uniform-prior ELBO, and $\\beta_H \\ne 1$
 is the $\\beta$-VAE-style reweighting.
+
+``--partner-kl-weight`` adds a stop-gradient partner-histogram KL: the empirical
+mix of neighbour types must match the SBM block row mixed by $q_i$ (and the
+in-neighbour analogue). Weight $0$ (default) is a no-op control. This is not
+homophily — neighbours should look like *partners of* $i$'s type.
 """
 
 from __future__ import annotations
@@ -70,6 +75,7 @@ from heldout import (
     write_metrics,
 )
 from index_mapping import load_mapping
+from partner_consistency import binary_adjacency_without_heldout, partner_kl_terms
 from subgraph_sampler import SubgraphBatchSampler
 from training_utils import (
     LABEL_SMOOTHING_TARGETS,
@@ -258,10 +264,16 @@ def train(args: argparse.Namespace) -> dict:
         f"entropy_beta={args.entropy_beta:g} "
         f"(ELBO uses sum_i H(q_i) over the minibatch; beta=1 is the uniform-prior bound)"
     )
+    print(
+        f"partner_kl_weight={args.partner_kl_weight:g} "
+        f"(KL(empirical neighbour-type mix || SBM block row); 0 disables the term)"
+    )
 
     held = load_heldout(Path(args.heldout_pairs))
     held_src_np = held["src"]
     held_tgt_np = held["tgt"]
+    adj_hist = binary_adjacency_without_heldout(adj, held)
+    adj_hist_t = adj_hist.T.tocsr()
     held_counts = (
         None
         if args.likelihood == "bernoulli"
@@ -320,6 +332,8 @@ def train(args: argparse.Namespace) -> dict:
             loss_sum = 0.0
             ll_sum = 0.0
             entropy_sum_acc = 0.0
+            partner_kl_out_acc = 0.0
+            partner_kl_in_acc = 0.0
             n_scored = 0
             n_batches = 0
             epoch_pos_obs = 0
@@ -358,9 +372,20 @@ def train(args: argparse.Namespace) -> dict:
                 # H(q_i) = -sum_k q_ik log q_ik; sum over the minibatch nodes.
                 entropy_sum = -(q * log_clamp(q)).sum()
                 obj = ll_term + args.entropy_beta * entropy_sum
+                prob_kk = edge_prob_kk(args.likelihood, eta, log_r)
+                if args.partner_kl_weight > 0.0:
+                    kl_out, kl_in = partner_kl_terms(
+                        q, q_logits, prob_kk, adj_hist, adj_hist_t, idx, device, dtype
+                    )
+                    obj = obj - args.partner_kl_weight * (kl_out + kl_in)
+                else:
+                    with torch.no_grad():
+                        kl_out, kl_in = partner_kl_terms(
+                            q, q_logits, prob_kk, adj_hist, adj_hist_t, idx, device, dtype
+                        )
                 # Normalize roughly by #kept pairs so loss scale is stable.
-                # LL and entropy share the factor, so their relative weight (and
-                # --entropy-beta) is unchanged.
+                # LL, entropy, and partner KL share the factor, so relative weights
+                # (--entropy-beta, --partner-kl-weight) are unchanged.
                 obj = obj * (idx.size * idx.size) / n_keep.clamp(min=1)
                 loss = -obj
 
@@ -370,11 +395,15 @@ def train(args: argparse.Namespace) -> dict:
                 loss_sum += float(loss.item())
                 ll_sum += float(ll_term.detach().item())
                 entropy_sum_acc += float(entropy_sum.detach().item())
+                partner_kl_out_acc += float(kl_out.detach().item())
+                partner_kl_in_acc += float(kl_in.detach().item())
                 n_scored += 1
 
             mean_loss = loss_sum / max(n_scored, 1)
             mean_ll_term = ll_sum / max(n_scored, 1)
             mean_entropy_term = entropy_sum_acc / max(n_scored, 1)
+            mean_kl_out = partner_kl_out_acc / max(n_scored, 1)
+            mean_kl_in = partner_kl_in_acc / max(n_scored, 1)
             cum_pos_obs += epoch_pos_obs
             max_abs_eta = max(max_abs_eta, epoch_max_abs_eta)
             last_epoch = epoch
@@ -399,6 +428,8 @@ def train(args: argparse.Namespace) -> dict:
                 f"loss={mean_loss:.4f} ll_term={mean_ll_term:.4f} "
                 f"entropy_sum={mean_entropy_term:.4f} "
                 f"entropy_beta={args.entropy_beta:g} "
+                f"partner_kl_out={mean_kl_out:.4f} partner_kl_in={mean_kl_in:.4f} "
+                f"partner_kl_weight={args.partner_kl_weight:g} "
                 f"val_ll={val_ll:.6f} val_auc={val_auc:.4f} "
                 f"best_val_{args.select_metric}={checkpoint.metric:.6f}@{checkpoint.epoch} "
                 f"clusters={n_used}/{args.k} max_abs_logit={epoch_max_abs_eta:.3f} "
@@ -482,6 +513,7 @@ def train(args: argparse.Namespace) -> dict:
         "label_smoothing_target": args.label_smoothing_target,
         "label_smoothing_applied": label_smoothing > 0.0,
         "entropy_beta": args.entropy_beta,
+        "partner_kl_weight": args.partner_kl_weight,
         "u_norm": args.u_norm,
         "u_scale": args.u_scale,
         "u_scale_init": args.u_scale_init,
@@ -583,6 +615,16 @@ def build_argparser() -> argparse.ArgumentParser:
             "Multiplier on sum_i H(q_i) in the minibatch ELBO (default 1 = standard "
             "uniform-prior bound). Values below 1 sharpen assignments; above 1 soften "
             "them. Selection still uses the held-out metric, never this reweighted loss"
+        ),
+    )
+    p.add_argument(
+        "--partner-kl-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight on KL(empirical neighbour-type mix || SBM-predicted mix) summed "
+            "over the minibatch (default 0 disables). Stop-grad on the empirical mix; "
+            "not a homophily term. Selection still uses the held-out metric"
         ),
     )
     add_u_norm_arguments(p)

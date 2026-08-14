@@ -159,6 +159,13 @@ Shared utilities live in [`training_utils.py`](training_utils.py) and
   remains held-out AUC / LL, never the reweighted training objective.
   `hp_best.json` must propagate `entropy_beta` into finals (otherwise retrains
   silently default to $1.0$).
+- `--partner-kl-weight` / `--lv-partner-kl-weights` add
+  $\mathrm{KL}(h_i^{\mathrm{out}}\Vert q_i\sigma(\eta))$ (and the in-neighbour
+  analogue) with stop-grad on the empirical neighbour mix. Default $0$ is the
+  control. This asks that neighbours look like *partners of* $i$'s type, not
+  like $i$ itself. Held-out positives are stripped from that adjacency.
+  `hp_best.json` must propagate `partner_kl_weight` the same way as
+  `entropy_beta`.
 
 ### Deferred
 
@@ -227,6 +234,23 @@ uv run python run_experiments.py \
   --lv-entropy-betas 0 0.1 0.3 1 3 \
   --select-metric auc --grad-clip 1.0 \
   --epochs 40 --final-epochs 40 --final-seeds 0 1 2
+```
+
+Partner-histogram KL on the same headline, with $\beta_H=0.3$ fixed and
+$\lambda\in\{0,0.1,0.3,1\}$ ($\lambda=0$ is the control). Select by AUC;
+Hungarian / $K_{\mathrm{pred}}$ are diagnostics.
+
+```bash
+uv run python launch_lightning_sweep.py \
+  --machine T4 --methods lv --studio-name flywrite-partner-kl \
+  --lv-dims 512 --lv-lrs 0.03 \
+  --lv-u-norms unit --lv-u-scales fixed --lv-u-scale-inits 16.0 \
+  --lv-entropy-betas 0.3 \
+  --lv-partner-kl-weights 0 0.1 0.3 1 \
+  --lv-likelihoods bernoulli --lv-bfs-fracs 1.0 \
+  --select-metric auc --grad-clip 1.0 \
+  --epochs 40 --final-epochs 40 --final-seeds 0 1 2 \
+  --detach-only --remote-stop-after
 ```
 
 On Lightning (cheaper T4 is enough for LV):
