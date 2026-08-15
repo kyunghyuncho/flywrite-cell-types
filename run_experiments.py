@@ -124,6 +124,15 @@ def entropy_flags(beta: float) -> list[str]:
     return ["--entropy-beta", str(beta)]
 
 
+def partner_kl_tag(weight: float) -> str:
+    """Run-name suffix; empty at the default (disabled) weight."""
+    return "" if abs(float(weight)) < 1e-12 else f"_pkl{weight:g}"
+
+
+def partner_kl_flags(weight: float) -> list[str]:
+    return ["--partner-kl-weight", str(weight)]
+
+
 def run_cmd(cmd: list[str]) -> None:
     print("\n=== RUN ===")
     print(" ".join(cmd))
@@ -202,12 +211,14 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
             args.lv_likelihoods,
             args.lv_label_smoothings,
             args.lv_entropy_betas,
+            args.lv_partner_kl_weights,
             u_norm_settings(args.lv_u_norms, args.lv_u_scales, args.lv_u_scale_inits),
         )
-        for d, lr, bfs_frac, likelihood, eps, entropy_beta, u_setting in lv_grid:
+        for d, lr, bfs_frac, likelihood, eps, entropy_beta, partner_kl, u_setting in lv_grid:
             name = (
                 f"hp_lv_d{d}_lr{lr}_bfs{bfs_frac}_{likelihood}"
-                f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}{entropy_tag(entropy_beta)}"
+                f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}"
+                f"{entropy_tag(entropy_beta)}{partner_kl_tag(partner_kl)}"
             )
             specs.append(
                 RunSpec(
@@ -221,6 +232,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         "likelihood": likelihood,
                         "label_smoothing": eps,
                         "entropy_beta": float(entropy_beta),
+                        "partner_kl_weight": float(partner_kl),
                         **u_norm_hyperparams(u_setting),
                     },
                     command=[
@@ -245,6 +257,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         *smoothing_flags(eps, args.label_smoothing_target),
                         *u_norm_flags(u_setting),
                         *entropy_flags(entropy_beta),
+                        *partner_kl_flags(partner_kl),
                         "--epochs",
                         str(args.epochs),
                         "--minibatch",
@@ -271,6 +284,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
         # each control costs as much as a BFS run.
         u_setting = u_norm_settings(args.lv_u_norms, args.lv_u_scales, args.lv_u_scale_inits)[0]
         entropy_beta = float(args.lv_entropy_betas[0])
+        partner_kl = float(args.lv_partner_kl_weights[0])
         for d in args.lv_dims[:1]:
             for lr in args.lv_lrs:
                 for likelihood in args.lv_likelihoods[:1]:
@@ -278,7 +292,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                     name = (
                         f"hp_lv_control_d{d}_lr{lr}_{likelihood}"
                         f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}"
-                        f"{entropy_tag(entropy_beta)}"
+                        f"{entropy_tag(entropy_beta)}{partner_kl_tag(partner_kl)}"
                     )
                     specs.append(
                         RunSpec(
@@ -292,6 +306,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                 "likelihood": likelihood,
                                 "label_smoothing": eps,
                                 "entropy_beta": entropy_beta,
+                                "partner_kl_weight": partner_kl,
                                 "target_updates": args.lv_control_updates,
                                 **u_norm_hyperparams(u_setting),
                             },
@@ -317,6 +332,7 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                                 *smoothing_flags(eps, args.label_smoothing_target),
                                 *u_norm_flags(u_setting),
                                 *entropy_flags(entropy_beta),
+                                *partner_kl_flags(partner_kl),
                                 "--target-updates",
                                 str(args.lv_control_updates),
                                 "--epochs",
@@ -416,11 +432,12 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                 tag = "control" if control else f"bfs{hp['bfs_frac']}"
                 eps = float(hp.get("label_smoothing", 0.0))
                 entropy_beta = float(hp.get("entropy_beta", 1.0))
+                partner_kl = float(hp.get("partner_kl_weight", 0.0))
                 u_setting = u_norm_of(hp)
                 name = (
                     f"final_lv_d{hp['d']}_lr{hp['lr']}_{tag}_{hp['likelihood']}"
                     f"{smoothing_tag(eps)}{u_norm_tag(u_setting)}"
-                    f"{entropy_tag(entropy_beta)}_seed{seed}"
+                    f"{entropy_tag(entropy_beta)}{partner_kl_tag(partner_kl)}_seed{seed}"
                 )
                 cmd = [
                     py,
@@ -444,6 +461,7 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                     *smoothing_flags(eps, args.label_smoothing_target),
                     *u_norm_flags(u_setting),
                     *entropy_flags(entropy_beta),
+                    *partner_kl_flags(partner_kl),
                     "--minibatch",
                     str(args.minibatch),
                     "--seed",
@@ -517,6 +535,7 @@ DIAGNOSTIC_KEYS = (
     "label_smoothing",
     "label_smoothing_target",
     "entropy_beta",
+    "partner_kl_weight",
     "label_smoothing_applied",
     "u_scale_value",
     "u_scale_value_max",
@@ -667,6 +686,16 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--lv-partner-kl-weights",
+        type=float,
+        nargs="+",
+        default=[0.0],
+        help=(
+            "LV partner-histogram KL weight grid; 0 disables. Nonzero values append "
+            "_pkl{weight} to run names. hp_best must propagate partner_kl_weight"
+        ),
+    )
+    p.add_argument(
         "--label-smoothing-target",
         choices=LABEL_SMOOTHING_TARGETS,
         default="base_rate",
@@ -747,6 +776,7 @@ def main() -> None:
                 hp["likelihood"] = str(best["likelihood"])
                 hp["label_smoothing"] = float(best.get("label_smoothing", 0.0))
                 hp["entropy_beta"] = float(best.get("entropy_beta", 1.0))
+                hp["partner_kl_weight"] = float(best.get("partner_kl_weight", 0.0))
                 hp.update(u_norm_hyperparams(u_norm_of(best)))
                 if best.get("target_updates"):
                     # Carry the matched-compute budget so a selected control stays a

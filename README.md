@@ -42,8 +42,9 @@ mattered, what did not, and which pieces of code embody each lesson.
 Together these take LV from Hungarian $\approx 2\,500$ (uniform minibatches,
 unconstrained decoder, LL selection) to $\approx 25\,100$ on the shared
 labelled neurons (multi-seed mean under AUC selection), and restoring the
-sum-entropy ELBO with AUC-selected $\beta_H=0.3$ further lifts the headline to
-$\approx 26\,800$.
+sum-entropy ELBO with AUC-selected $\beta_H=0.3$ lifts the result to
+$\approx 26\,800$, and partner-histogram KL with $\lambda=1$ raises the
+headline further to $\approx 27\,600$.
 
 ### What did not matter
 
@@ -77,7 +78,8 @@ $K=729$ assignment scores $\approx 980$.
 | method | Hungarian (mean $\pm$ std) | fraction of $46\,479$ | ARI | NMI | $K_{\mathrm{pred}}$ (labelled) | seeds |
 | --- | --- | --- | --- | --- | --- | --- |
 | Unseeded NTAC | $30\,654.5 \pm 24.7$ | $66.0\%$ | $0.676$ | $0.878$ | $\approx 226$–$260$ | $2$ |
-| **LV vSBM (BFS + unit-norm + AUC, $\beta_H=0.3$)** | $\mathbf{26\,837 \pm 339}$ | $\mathbf{57.7\%}$ | $0.609$ | $0.862$ | $\approx 401\pm42$ | $3$ |
+| **LV with $\beta_H=0.3$ + partner KL $\lambda=1$** | $\mathbf{27\,644 \pm 32}$ | $\mathbf{59.5\%}$ | $0.600$ | $0.889$ | $\approx 362\pm15$ | $3$ |
+| LV vSBM (BFS + unit-norm + AUC, $\beta_H=0.3$ only) | $26\,837 \pm 339$ | $57.7\%$ | $0.609$ | $0.862$ | $\approx 401\pm42$ | $3$ |
 | LV vSBM (prior AUC width sweep) | $25\,095.3 \pm 911.6$ | $54.0\%$ | $0.522$ | $0.828$ | $\approx 383$–$481$ | $3$ |
 | LV, earlier unit-norm sweep ($d=256$, LL-selected) | $24\,300.0 \pm 971.6$ | $52.3\%$ | $0.488$ | $0.822$ | $\approx 388$–$484$ | $3$ |
 | LV, unconstrained decoder (same sampler) | $8\,459.7 \pm 354.1$ | $18.2\%$ | $0.177$ | $0.509$ | — | $3$ |
@@ -86,13 +88,14 @@ $K=729$ assignment scores $\approx 980$.
 | PCA $+\,k$-means | $1\,355.0 \pm 88.8$ | $2.9\%$ | $0.008$ | $0.225$ | — | $3$ |
 | random $K=729$ assignment | $980.0 \pm 8.0$ | $2.1\%$ | $0.000$ | $0.202$ | $729$ (by construction) | $20$ |
 
-The headline LV configuration is the restored sum-entropy ELBO with AUC-selected
-$\beta_H=0.3$ on `d=512, lr=0.03, bernoulli, bfs_frac=1.0, --u-norm unit
---u-scale fixed --u-scale-init 16`, $40$ epochs, seeds $0/1/2$; held-out AUC
-$0.9859\pm0.0003$. That beats the prior LV bar ($\approx 25\,095$) while
-remaining below NTAC ($\approx 30\,654$), which is still coarser in
-$K_{\mathrm{pred}}$. Closing the gap is open; a free $K\times K$ block table
-is an optional next step.
+The headline LV configuration augments the restored sum-entropy ELBO at
+$\beta_H=0.3$ with partner-histogram KL at $\lambda=1$, using `d=512,
+lr=0.03, bernoulli, bfs_frac=1.0, --u-norm unit --u-scale fixed
+--u-scale-init 16`, $40$ epochs, and seeds $0/1/2$; held-out AUC is
+$0.9897\pm0.0002$. Its Hungarian score of $27\,644\pm32$ closes the gap to
+NTAC to approximately $3\,010$ neurons (about $90\%$ of the NTAC score), while
+NTAC remains coarser in $K_{\mathrm{pred}}$. A free $K\times K$ block table
+remains an optional next step.
 
 ## Data
 
@@ -159,11 +162,19 @@ Shared utilities live in [`training_utils.py`](training_utils.py) and
   remains held-out AUC / LL, never the reweighted training objective.
   `hp_best.json` must propagate `entropy_beta` into finals (otherwise retrains
   silently default to $1.0$).
+- `--partner-kl-weight` / `--lv-partner-kl-weights` add
+  $\mathrm{KL}(h_i^{\mathrm{out}}\Vert q_i\sigma(\eta))$ (and the in-neighbour
+  analogue) with stop-grad on the empirical neighbour mix. Default $0$ is the
+  control. This asks that neighbours look like *partners of* $i$'s type, not
+  like $i$ itself. Held-out positives are stripped from that adjacency.
+  `hp_best.json` must propagate `partner_kl_weight` the same way as
+  `entropy_beta`.
 
 ### Deferred
 
-These stay out of the code on purpose (entropy $\beta_H$ is settled; free $B$
-remains an optional next experiment):
+These stay out of the code on purpose (entropy $\beta_H$ and partner KL at
+$\lambda=1$ are settled; free $B$ remains an optional next experiment). The
+headline remains below NTAC:
 
 1. **Adjacency smoothness on $q$.** Pulling neighbouring neurons toward similar
    posteriors is a homophily prior. FlyWire visual types are defined by partner
@@ -227,6 +238,42 @@ uv run python run_experiments.py \
   --lv-entropy-betas 0 0.1 0.3 1 3 \
   --select-metric auc --grad-clip 1.0 \
   --epochs 40 --final-epochs 40 --final-seeds 0 1 2
+```
+
+#### Partner-histogram KL ablation
+
+With $\beta_H=0.3$ fixed, the AUC-selected hyperparameter sweep produced:
+
+| $\lambda$ | held-out AUC | Hungarian |
+| ---: | ---: | ---: |
+| $0$ | $0.9856$ | $26\,568$ |
+| $0.1$ | $0.9864$ | $27\,121$ |
+| $0.3$ | $0.9873$ | $26\,633$ |
+| $1$ | $0.9897$ | $28\,272$ |
+| $2$ | $0.9908$ | $27\,898$ |
+| $3$ | $0.9913$ | $24\,439$ |
+| $5$ | $0.9916$ | $24\,480$ |
+
+The three-seed final at $\lambda=1$ achieves Hungarian $27\,644\pm32$, ARI
+$0.600\pm0.007$, NMI $0.889\pm0.004$, $K_{\mathrm{pred}}=362\pm15$, and AUC
+$0.9897\pm0.0002$. In contrast, the AUC-selected $\lambda=5$ final achieves
+Hungarian $25\,534\pm542$, worse than the $\beta_H=0.3$-only result. Thus,
+**$\lambda$ should be capped at $1$**: beyond this point, held-out AUC continues
+to improve while Hungarian agreement collapses, a proxy--target split. The
+scientific headline is therefore $\beta_H=0.3$ with $\lambda=1$, not the
+AUC-selected $\lambda=5$ configuration.
+
+```bash
+uv run python launch_lightning_sweep.py \
+  --machine T4 --methods lv --studio-name flywrite-partner-kl \
+  --lv-dims 512 --lv-lrs 0.03 \
+  --lv-u-norms unit --lv-u-scales fixed --lv-u-scale-inits 16.0 \
+  --lv-entropy-betas 0.3 \
+  --lv-partner-kl-weights 0 0.1 0.3 1 \
+  --lv-likelihoods bernoulli --lv-bfs-fracs 1.0 \
+  --select-metric auc --grad-clip 1.0 \
+  --epochs 40 --final-epochs 40 --final-seeds 0 1 2 \
+  --detach-only --remote-stop-after
 ```
 
 On Lightning (cheaper T4 is enough for LV):
