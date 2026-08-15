@@ -154,6 +154,30 @@ The same files may instead be supplied explicitly with `--adjacency`,
 ablation, export with `--category "OL intrinsic"` and pass its
 `*_ol_intrinsic` adjacency and mapping explicitly.
 
+### Isolated vertices under NTAC
+
+Inducing on visual neurons deletes every cross-region edge, which strands $24$
+of the $46\,479$ vertices with no surviving in-graph partner. Upstream
+`ntac.unseeded.convert.problem_from_data` builds its vertex-name list from edge
+endpoints alone and then indexes it with the original matrix indices, so any
+isolate shifts the two out of registration and aborts the run with an
+`IndexError`. [`train_ntac.py`](train_ntac.py) therefore drops degree-zero
+vertices before handing the graph to NTAC and restores them afterwards under a
+dedicated residual label: equitable partitioning has no evidence about them, and
+folding them into a real cluster would corrupt that cluster's Hungarian match.
+NTAC is thus still scored on exactly the vertex set LV and PCA are scored on.
+
+### Device selection
+
+Unseeded NTAC offloads only the weighted-Jaccard distance kernel, and it
+re-uploads the whole CSR on every call, so the GPU buys little. Measured on the
+visual subgraph to $k=32$: $48.0$ s on an L4 against $61.9$ s on $16$ vCPU,
+$49.7$ s on $8$ and $66.8$ s on $4$ — about $1.3$–$1.9\times$, far below the GPU
+price premium. NTAC accordingly runs on a CPU Studio via
+`launch_lightning_sweep.py --device cpu`, while LV keeps the GPU. The wrapper
+prints the distance kernel it actually selected, because NTAC reverts to CPU
+silently when the numba CUDA toolchain fails to link.
+
 ## Setup
 
 **Data** (FlyWire data version 783, unfiltered connections and names):

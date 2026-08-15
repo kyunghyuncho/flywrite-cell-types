@@ -55,6 +55,30 @@ def _permute_csr(adj: sp.csr_matrix, perm: np.ndarray) -> sp.csr_matrix:
     ).tocsr()
 
 
+def _compact_nonisolated(adj: sp.csr_matrix) -> tuple[sp.csr_matrix, np.ndarray]:
+    """Drop degree-zero vertices and return the surviving original indices.
+
+    ``ntac.unseeded.convert.problem_from_data`` builds its vertex-name list from
+    edge endpoints alone (``np.unique`` over the COO rows and columns) and then
+    indexes that list with the *original* matrix indices, ``vertex_names[u]``.
+    The two agree only when every vertex carries at least one edge: an isolate
+    shortens the name list without shifting the indices, so an endpoint index
+    beyond the truncated list raises ``IndexError``. The same mismatch also
+    leaves ``problem.numv`` smaller than the ``n``-by-``n`` matrix it stores in
+    ``problem.A_``, so passing isolates through is unsound even when the index
+    happens to stay in range.
+
+    The induced visual subgraph triggers this: inducing on visual neurons drops
+    every cross-region edge, which strands a handful of vertices with no
+    surviving in-graph partner.
+    """
+    row_nnz = np.diff(adj.indptr)
+    col_nnz = np.diff(adj.tocsc().indptr)
+    active_indices = np.flatnonzero((row_nnz + col_nnz) > 0)
+    compact = adj[active_indices][:, active_indices].tocsr()
+    return compact, active_indices
+
+
 def train(args: argparse.Namespace) -> dict:
     if args.device == "cpu":
         force_cpu = True
@@ -74,9 +98,15 @@ def train(args: argparse.Namespace) -> dict:
     adj.data = np.maximum(adj.data, 0.0)
     adj.eliminate_zeros()
     adj = adj.tocsr()
+    n_total = adj.shape[0]
+    adj, active_indices = _compact_nonisolated(adj)
     n = adj.shape[0]
+    n_isolates = n_total - n
+    if n == 0:
+        raise ValueError("NTAC requires at least one non-isolated vertex")
     print(
-        f"NTAC unseeded: n={n} nnz={adj.nnz} max_k={args.max_k} "
+        f"NTAC unseeded: n={n_total} active={n} isolates={n_isolates} "
+        f"nnz={adj.nnz} max_k={args.max_k} "
         f"R={args.max_iterations} T={args.frac_seeds} seed={args.seed} "
         f"device={'cpu' if force_cpu else 'cuda-if-available'}"
     )
@@ -90,10 +120,13 @@ def train(args: argparse.Namespace) -> dict:
     data = GraphData(a_csr, labels=dummy_labels)
 
     problem = convert.problem_from_data(data)
-    if force_cpu:
-        problem.set_device("cpu")
-    else:
-        problem.set_device("default")
+    problem.set_device("cpu" if force_cpu else "default")
+    # NTAC only offloads the weighted-Jaccard distance kernel, and it silently
+    # reverts to CPU when the numba CUDA toolchain fails to link. Report the
+    # kernel that was actually selected so a fallback cannot masquerade as a GPU
+    # run in the sweep log.
+    kernel = getattr(problem.all_distances_func, "__name__", repr(problem.all_distances_func))
+    print(f"NTAC distance kernel: {kernel}", flush=True)
 
     best_partition, _last, history = solve_unseeded(
         problem,
@@ -106,8 +139,15 @@ def train(args: argparse.Namespace) -> dict:
     )
     labels_perm = np.asarray(best_partition.labels(), dtype=np.int64)
     # Map back to original vertex order.
-    assignments = np.empty(n, dtype=np.int64)
-    assignments[perm] = labels_perm
+    active_assignments = np.empty(n, dtype=np.int64)
+    active_assignments[perm] = labels_perm
+    # Isolates must still appear in the exported dict so that NTAC is scored on
+    # exactly the vertex set LV and PCA are scored on. Equitable partitioning has
+    # no evidence about them, so they go to their own residual label rather than
+    # contaminating a real NTAC cluster's ground-truth match.
+    isolate_label = int(active_assignments.max()) + 1 if n else 0
+    assignments = np.full(n_total, isolate_label, dtype=np.int64)
+    assignments[active_indices] = active_assignments
     jac = float(history[-1][1])
     n_clusters = int(len(np.unique(assignments)))
     # Higher is better across methods.
@@ -130,6 +170,9 @@ def train(args: argparse.Namespace) -> dict:
         "max_iterations": args.max_iterations,
         "frac_seeds": args.frac_seeds,
         "center_size": args.center_size,
+        "n_vertices": n_total,
+        "n_active_vertices": n,
+        "n_isolates": n_isolates,
         "n_pred_clusters": n_clusters,
         "history_len": len(history),
     }

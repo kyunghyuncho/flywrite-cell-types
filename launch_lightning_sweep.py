@@ -181,6 +181,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--studio-name", default="flywrite-gnn-vsbm")
     parser.add_argument("--machine", default="L4")
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help=(
+            "Torch/NTAC device for the remote trainers. Use 'cpu' when the Studio "
+            "runs on a CPU machine; unseeded NTAC only gains ~1.3x from an L4, so "
+            "it is cheaper to run on CPU while LV keeps the GPU."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=15, help="HP-search LV epochs")
     parser.add_argument("--final-epochs", type=int, default=40, help="Final LV epochs")
     parser.add_argument("--minibatch", type=int, default=2048)
@@ -376,7 +385,7 @@ def main() -> None:
 
         methods = " ".join(args.methods)
         sweep_args = (
-            f"--device cuda --phase {args.phase} "
+            f"--device {shlex.quote(args.device)} --phase {args.phase} "
             f"--methods {methods} "
             f"--graph-scope {shlex.quote(args.graph_scope)} "
             f"--adjacency {shlex.quote(remote_graph_paths['adjacency'])} "
