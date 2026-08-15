@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sys
 import tarfile
 import time
@@ -23,6 +24,7 @@ from pathlib import Path
 from lightning_sdk import Machine, Studio
 
 from heldout import LIKELIHOODS
+from run_experiments import resolve_graph_paths
 from training_utils import (
     DEFAULT_U_SCALE_INIT,
     LABEL_SMOOTHING_TARGETS,
@@ -52,16 +54,13 @@ CODE_FILES = [
     "requirements.txt",
     "README.md",
     "launch_lightning_sweep.py",
+    "export_visual_subgraph.py",
     "remote_start_unsup_sweep.sh",
     "remote_status_unsup_sweep.sh",
     "remote_stop_studio.py",
 ]
 
-DATA_FILES = [
-    "sparse_connectivity_matrix.npz",
-    "root_id_to_index_mapping.json",
-    "root_id_type_dict.pkl",
-]
+STATIC_DATA_FILES = ["root_id_type_dict.pkl"]
 
 SUMMARY_ARTIFACTS = [
     "heldout_pairs.npz",
@@ -263,6 +262,11 @@ def main() -> None:
         help="Methods to sweep",
     )
     parser.add_argument("--phase", choices=["all", "hp", "final"], default="all")
+    parser.add_argument("--graph-scope", choices=("full", "visual"), default="full")
+    parser.add_argument("--adjacency", help="Override the graph-scope adjacency path")
+    parser.add_argument("--mapping", help="Override the graph-scope root-ID mapping path")
+    parser.add_argument("--heldout-pairs", help="Override the graph-scope pair split path")
+    parser.add_argument("--heldout-rows", help="Override the graph-scope row split path")
     parser.add_argument("--skip-upload", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument(
@@ -302,6 +306,8 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if not args.download_only:
+        resolve_graph_paths(args, require_inputs=not args.skip_upload)
     require_auth()
 
     user = os.environ.get("LIGHTNING_USERNAME", "kc119")
@@ -333,14 +339,29 @@ def main() -> None:
         return
 
     try:
+        remote_graph_paths = {
+            name: Path(getattr(args, name)).name
+            for name in ("adjacency", "mapping", "heldout_pairs", "heldout_rows")
+        }
         if not args.skip_upload:
             print("Uploading code and data...")
-            for name in CODE_FILES + DATA_FILES:
-                local = (REPO_ROOT / name).resolve()
+            uploads = [((REPO_ROOT / name).resolve(), name) for name in CODE_FILES]
+            uploads.extend(((REPO_ROOT / name).resolve(), name) for name in STATIC_DATA_FILES)
+            uploads.extend(
+                [
+                    (Path(args.adjacency).resolve(), remote_graph_paths["adjacency"]),
+                    (Path(args.mapping).resolve(), remote_graph_paths["mapping"]),
+                ]
+            )
+            for name in ("heldout_pairs", "heldout_rows"):
+                local = Path(getattr(args, name)).resolve()
+                if local.exists():
+                    uploads.append((local, remote_graph_paths[name]))
+            for local, remote in uploads:
                 if not local.exists():
                     raise SystemExit(f"Missing {local}")
-                print(f"  -> {name}")
-                studio.upload_file(str(local), name)
+                print(f"  -> {remote}")
+                studio.upload_file(str(local), remote)
 
         out, code = studio_run(
             studio,
@@ -357,6 +378,11 @@ def main() -> None:
         sweep_args = (
             f"--device cuda --phase {args.phase} "
             f"--methods {methods} "
+            f"--graph-scope {shlex.quote(args.graph_scope)} "
+            f"--adjacency {shlex.quote(remote_graph_paths['adjacency'])} "
+            f"--mapping {shlex.quote(remote_graph_paths['mapping'])} "
+            f"--heldout-pairs {shlex.quote(remote_graph_paths['heldout_pairs'])} "
+            f"--heldout-rows {shlex.quote(remote_graph_paths['heldout_rows'])} "
             f"--split-seed {args.split_seed} "
             f"--epochs {args.epochs} --final-epochs {args.final_epochs} "
             f"--minibatch {args.minibatch} "

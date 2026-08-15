@@ -131,6 +131,29 @@ Baselines kept in-tree: PCA $+$ $k$-means
 ([`train_pca_baseline.py`](train_pca_baseline.py)) and unseeded NTAC
 ([`train_ntac.py`](train_ntac.py)).
 
+## Visual-system subgraph protocol
+
+Protocol (1) fits both NTAC and LV-vSBM on the induced subgraph of neurons with
+FlyWire visual-type annotations. This matches the NTAC paper's visual-system
+setting more closely than fitting the full-brain graph and restricting only the
+reported assignments. Export the graph once, then select it by scope:
+
+```bash
+uv run python export_visual_subgraph.py \
+  --adjacency sparse_connectivity_matrix.npz \
+  --mapping root_id_to_index_mapping.json \
+  --visual-types visual_neuron_types.csv.gz
+
+uv run python run_experiments.py \
+  --graph-scope visual --methods ntac lv \
+  --ntac-max-ks 729
+```
+
+The same files may instead be supplied explicitly with `--adjacency`,
+`--mapping`, `--heldout-pairs`, and `--heldout-rows`. For the OL-intrinsic
+ablation, export with `--category "OL intrinsic"` and pass its
+`*_ol_intrinsic` adjacency and mapping explicitly.
+
 ## Setup
 
 **Data** (FlyWire data version 783, unfiltered connections and names):

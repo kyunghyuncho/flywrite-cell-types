@@ -35,6 +35,10 @@ heldout_rows.npz
 
 *.png
 root_id_to_index_mapping.json
+root_id_to_index_mapping_visual.json
+root_id_to_index_mapping_ol_intrinsic.json
+visual_subgraph_meta*.json
+heldout_*visual*
 uv.lock
 lightning_unsup_sweep.log
 *.log

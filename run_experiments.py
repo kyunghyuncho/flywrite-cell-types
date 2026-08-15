@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import subprocess
 import sys
@@ -33,6 +34,38 @@ from training_utils import (
     U_NORMS,
     U_SCALES,
 )
+
+GRAPH_DEFAULTS = {
+    "full": {
+        "adjacency": "sparse_connectivity_matrix.npz",
+        "mapping": "root_id_to_index_mapping.json",
+        "heldout_pairs": "heldout_pairs.npz",
+        "heldout_rows": "heldout_rows.npz",
+    },
+    "visual": {
+        "adjacency": "sparse_connectivity_matrix_visual.npz",
+        "mapping": "root_id_to_index_mapping_visual.json",
+        "heldout_pairs": "heldout_pairs_visual.npz",
+        "heldout_rows": "heldout_rows_visual.npz",
+    },
+}
+
+
+def resolve_graph_paths(args: argparse.Namespace, require_inputs: bool = True) -> None:
+    """Resolve scope-dependent graph paths while preserving explicit overrides."""
+    defaults = GRAPH_DEFAULTS[args.graph_scope]
+    for name, default in defaults.items():
+        if getattr(args, name, None) is None:
+            setattr(args, name, default)
+
+    if require_inputs:
+        missing = [
+            name for name in ("adjacency", "mapping") if not Path(getattr(args, name)).exists()
+        ]
+        if missing:
+            detail = ", ".join(f"--{name}={getattr(args, name)}" for name in missing)
+            hint = " Run export_visual_subgraph.py first." if args.graph_scope == "visual" else ""
+            raise FileNotFoundError(f"Missing graph input(s): {detail}.{hint}")
 
 
 @dataclass(frozen=True)
@@ -143,23 +176,56 @@ def run_cmd(cmd: list[str]) -> None:
         raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
 
 
+def _adjacency_identity(path: Path, shape: tuple[int, int], nnz: int) -> dict:
+    stat = path.stat()
+    resolved = str(path.resolve())
+    return {
+        "path_sha256": hashlib.sha256(resolved.encode()).hexdigest(),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "shape": list(shape),
+        "nnz": nnz,
+    }
+
+
+def _heldout_matches(path: Path, adjacency_identity: dict) -> bool:
+    meta_path = path.with_suffix(".meta.json")
+    if not path.exists() or not meta_path.exists():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return meta.get("adjacency") == adjacency_identity
+
+
+def _save_heldout_with_identity(path: Path, adjacency_identity: dict, **arrays: np.ndarray) -> None:
+    save_heldout(path, **arrays)
+    meta_path = path.with_suffix(".meta.json")
+    meta = json.loads(meta_path.read_text())
+    meta["adjacency"] = adjacency_identity
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+
+
 def ensure_heldout(args: argparse.Namespace) -> None:
-    adj = load_npz(args.adjacency)
+    adjacency_path = Path(args.adjacency)
+    adj = load_npz(adjacency_path)
     adj.data = (adj.data > 0).astype(np.float32)
     adj.eliminate_zeros()
+    identity = _adjacency_identity(adjacency_path, adj.shape, int(adj.nnz))
 
     pairs_path = Path(args.heldout_pairs)
     rows_path = Path(args.heldout_rows)
-    if not pairs_path.exists():
-        print(f"Creating held-out pairs at {pairs_path} ...")
+    if not _heldout_matches(pairs_path, identity):
+        print(f"Creating held-out pairs for {adjacency_path} at {pairs_path} ...")
         pairs = make_heldout_pairs(
             adj, n_pos=args.n_heldout_pos, n_neg=args.n_heldout_neg, seed=args.split_seed
         )
-        save_heldout(pairs_path, **pairs)
-    if not rows_path.exists():
-        print(f"Creating held-out rows at {rows_path} ...")
+        _save_heldout_with_identity(pairs_path, identity, **pairs)
+    if not _heldout_matches(rows_path, identity):
+        print(f"Creating held-out rows for {adjacency_path} at {rows_path} ...")
         rows = make_heldout_rows(adj.shape[0], fraction=args.row_holdout, seed=args.split_seed)
-        save_heldout(rows_path, rows=rows)
+        _save_heldout_with_identity(rows_path, identity, rows=rows)
 
 
 def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
@@ -181,6 +247,10 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                         command=[
                             py,
                             "train_pca_baseline.py",
+                            "--adjacency",
+                            args.adjacency,
+                            "--mapping",
+                            args.mapping,
                             "--k",
                             str(args.k),
                             "--d",
@@ -238,6 +308,10 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                     command=[
                         py,
                         "train_lv_vsbm.py",
+                        "--adjacency",
+                        args.adjacency,
+                        "--mapping",
+                        args.mapping,
                         "--k",
                         str(args.k),
                         "--d",
@@ -313,6 +387,10 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                             command=[
                                 py,
                                 "train_lv_vsbm.py",
+                                "--adjacency",
+                                args.adjacency,
+                                "--mapping",
+                                args.mapping,
                                 "--k",
                                 str(args.k),
                                 "--d",
@@ -372,6 +450,10 @@ def hp_specs(args: argparse.Namespace) -> list[RunSpec]:
                             command=[
                                 py,
                                 "train_ntac.py",
+                                "--adjacency",
+                                args.adjacency,
+                                "--mapping",
+                                args.mapping,
                                 "--max-k",
                                 str(max_k),
                                 "--max-iterations",
@@ -410,6 +492,10 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                 cmd = [
                     py,
                     "train_pca_baseline.py",
+                    "--adjacency",
+                    args.adjacency,
+                    "--mapping",
+                    args.mapping,
                     "--k",
                     str(args.k),
                     "--d",
@@ -442,6 +528,10 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                 cmd = [
                     py,
                     "train_lv_vsbm.py",
+                    "--adjacency",
+                    args.adjacency,
+                    "--mapping",
+                    args.mapping,
                     "--k",
                     str(args.k),
                     "--d",
@@ -487,6 +577,10 @@ def final_specs(args: argparse.Namespace, best_by_method: dict[str, dict]) -> li
                 cmd = [
                     py,
                     "train_ntac.py",
+                    "--adjacency",
+                    args.adjacency,
+                    "--mapping",
+                    args.mapping,
                     "--max-k",
                     str(hp["max_k"]),
                     "--max-iterations",
@@ -586,7 +680,9 @@ def pred_path_for(prefix: str) -> Path:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--adjacency", default="sparse_connectivity_matrix.npz")
+    p.add_argument("--graph-scope", choices=("full", "visual"), default="full")
+    p.add_argument("--adjacency", help="Override the graph-scope adjacency path")
+    p.add_argument("--mapping", help="Override the graph-scope root-ID mapping path")
     p.add_argument("--gt", default="root_id_type_dict.pkl")
     p.add_argument("--device", default="cuda")
     p.add_argument("--k", type=int, default=729)
@@ -606,8 +702,8 @@ def main() -> None:
         help="Full PCA SGD steps for multi-seed finals",
     )
     p.add_argument("--split-seed", type=int, default=0)
-    p.add_argument("--heldout-pairs", default="heldout_pairs.npz")
-    p.add_argument("--heldout-rows", default="heldout_rows.npz")
+    p.add_argument("--heldout-pairs", help="Override the graph-scope pair split path")
+    p.add_argument("--heldout-rows", help="Override the graph-scope row split path")
     p.add_argument("--n-heldout-pos", type=int, default=50_000)
     p.add_argument("--n-heldout-neg", type=int, default=50_000)
     p.add_argument("--row-holdout", type=float, default=0.1)
@@ -729,6 +825,7 @@ def main() -> None:
     p.add_argument("--phase", choices=["all", "hp", "final"], default="all")
     args = p.parse_args()
 
+    resolve_graph_paths(args)
     ensure_heldout(args)
     gt = load_ground_truth(Path(args.gt))
 
