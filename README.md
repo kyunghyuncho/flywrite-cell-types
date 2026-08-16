@@ -173,7 +173,8 @@ recovery of cell-type structure from connectivity alone.
 
 The last row is not a competing number and the two NTAC rows are not
 comparable. That run was fitted on the visual subgraph
-(see the visual-scope protocol), so $87\,702$ of its nodes are unscored and
+(see [Visual-system subgraph protocol](#visual-system-subgraph-protocol-alternative-scope)),
+so $87\,702$ of its nodes are unscored and
 collapse into one reserved cluster that happens to align almost perfectly with
 the sink; roughly $65$ percentage points of its $91.4\%$ are that free
 alignment, which the split-only oracle row isolates. A visual-scope partition
@@ -271,6 +272,12 @@ evidence it relies on while leaving NTAC's equitable partitioning of the
 labelled vertex set intact. Whether the gap is intrinsic or an artefact of a
 $36$-point grid is not settled by these runs; both readings are consistent with
 the near-identical held-out AUC ($0.987$) across the grid's top configurations.
+
+Partitions produced under this scope cover only the $46\,479$ labelled vertices,
+so they cannot be entered into the
+[full-brain sink protocol](#full-brain-sink-protocol) as competitors: there,
+every unscored node collapses into a reserved cluster that aligns with the sink
+and inflates the score by roughly $65$ percentage points.
 
 ### Isolated vertices under NTAC
 
