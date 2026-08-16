@@ -15,6 +15,13 @@ FlyWire, and how it compares to the connectivity-only baseline NTAC
 
 ## Results
 
+The main setting is the **full brain**: every method is fitted on the complete
+$n=134\,181$ connectome and scored on the labelled subset. A narrower
+visual-system scope is available as an alternative protocol and is reported
+separately in [Visual-system subgraph protocol](#visual-system-subgraph-protocol-alternative-scope);
+the two scopes are different fitting problems and their numbers are not
+interchangeable.
+
 Agreement with the $729$ FlyWire visual types on the labelled subset.
 Hyperparameters are chosen by held-out edge AUC; Hungarian / ARI / NMI /
 $K_{\mathrm{pred}}$ are diagnostics. The theoretical maximum Hungarian score
@@ -130,6 +137,110 @@ Orchestration: [`run_experiments.py`](run_experiments.py). Remote sweeps:
 Baselines kept in-tree: PCA $+$ $k$-means
 ([`train_pca_baseline.py`](train_pca_baseline.py)) and unseeded NTAC
 ([`train_ntac.py`](train_ntac.py)).
+
+## Visual-system subgraph protocol (alternative scope)
+
+This section describes an **optional alternative** to the full-brain setting
+above, not a replacement for it. Here both NTAC and LV-vSBM are fitted on the
+induced subgraph of the $46\,479$ neurons carrying a FlyWire visual-type
+annotation, so that training scope and evaluation scope coincide. Its purpose
+is a like-for-like comparison against the NTAC paper, which works in the
+visual system: on the full brain a method must also spend capacity on the
+$87\,702$ unlabelled neurons, and one may reasonably object that this
+handicaps it relative to the published setting. The subgraph protocol removes
+that objection at the cost of conditioning the whole experiment on the
+visual / non-visual split — information no unsupervised method is otherwise
+given. For that reason the full brain remains the primary scientific setting
+and these numbers are read alongside, not against, the table above.
+
+Export the graph once, then select it by scope:
+
+```bash
+uv run python export_visual_subgraph.py \
+  --adjacency sparse_connectivity_matrix.npz \
+  --mapping root_id_to_index_mapping.json \
+  --visual-types visual_neuron_types.csv.gz
+
+uv run python run_experiments.py \
+  --graph-scope visual --methods ntac lv \
+  --ntac-max-ks 729
+```
+
+The same files may instead be supplied explicitly with `--adjacency`,
+`--mapping`, `--heldout-pairs`, and `--heldout-rows`. For the OL-intrinsic
+ablation, export with `--category "OL intrinsic"` and pass its
+`*_ol_intrinsic` adjacency and mapping explicitly.
+
+### LV hyperparameter grid on the visual subgraph
+
+The induced graph is a different optimisation problem from the full brain, so
+the full-brain optimum is not transferable and the visual scope is searched on
+its own $36$-point grid: $d\in\{256,512\}$, learning rate
+$\in\{0.01,0.03\}$, entropy weight $\beta_H\in\{0.1,0.3,1.0\}$ and
+partner-histogram KL weight $\lambda\in\{0,0.3,1\}$, with `bfs_frac=1`, a
+Bernoulli likelihood and unit-norm cluster embeddings at fixed scale $16$ held
+fixed. Selection uses held-out edge AUC at $40$ epochs — the same budget as the
+finals, since a shorter search ranks configurations by their transient early
+behaviour rather than by where they converge:
+
+```bash
+uv run python launch_lightning_sweep.py \
+  --studio-name flywrite-visual-lv-hp --machine T4 \
+  --graph-scope visual --methods lv --phase all \
+  --lv-dims 256 512 --lv-lrs 0.01 0.03 --lv-bfs-fracs 1.0 \
+  --lv-likelihoods bernoulli \
+  --lv-u-norms unit --lv-u-scales fixed --lv-u-scale-inits 16.0 \
+  --lv-entropy-betas 0.1 0.3 1.0 --lv-partner-kl-weights 0 0.3 1.0 \
+  --select-metric auc --grad-clip 1.0 \
+  --epochs 40 --final-epochs 40 --final-seeds 0 1 2 \
+  --detach-only --remote-stop-after
+```
+
+### Results under the alternative scope
+
+Both methods are fitted and scored on the same $46\,479$ vertices, three seeds
+each, with the LV configuration selected by the grid above ($d=256$, learning
+rate $0.03$, $\beta_H=0.3$, $\lambda=1$).
+
+| method (visual scope) | Hungarian | fraction | ARI | NMI |
+| --- | ---: | ---: | ---: | ---: |
+| Unseeded NTAC | $\mathbf{34\,951 \pm 913}$ | $\mathbf{75.2\%}$ | $0.754$ | $0.902$ |
+| LV-vSBM | $15\,182 \pm 194$ | $32.7\%$ | $0.255$ | $0.819$ |
+
+Restricting the graph moves the two methods in opposite directions. NTAC
+improves on its full-brain score ($30\,654$ to $34\,951$), whereas LV-vSBM
+falls well below its own ($27\,644$ to $15\,182$) even after its
+hyperparameters are re-searched on this scope. Inducing on visual neurons
+deletes every edge to the rest of the brain, and LV-vSBM estimates block
+structure from exactly those connectivity profiles, so the truncation removes
+evidence it relies on while leaving NTAC's equitable partitioning of the
+labelled vertex set intact. Whether the gap is intrinsic or an artefact of a
+$36$-point grid is not settled by these runs; both readings are consistent with
+the near-identical held-out AUC ($0.987$) across the grid's top configurations.
+
+### Isolated vertices under NTAC
+
+Inducing on visual neurons deletes every cross-region edge, which strands $24$
+of the $46\,479$ vertices with no surviving in-graph partner. Upstream
+`ntac.unseeded.convert.problem_from_data` builds its vertex-name list from edge
+endpoints alone and then indexes it with the original matrix indices, so any
+isolate shifts the two out of registration and aborts the run with an
+`IndexError`. [`train_ntac.py`](train_ntac.py) therefore drops degree-zero
+vertices before handing the graph to NTAC and restores them afterwards under a
+dedicated residual label: equitable partitioning has no evidence about them, and
+folding them into a real cluster would corrupt that cluster's Hungarian match.
+NTAC is thus still scored on exactly the vertex set LV and PCA are scored on.
+
+### Device selection
+
+Unseeded NTAC offloads only the weighted-Jaccard distance kernel, and it
+re-uploads the whole CSR on every call, so the GPU buys little. Measured on the
+visual subgraph to $k=32$: $48.0$ s on an L4 against $61.9$ s on $16$ vCPU,
+$49.7$ s on $8$ and $66.8$ s on $4$ — about $1.3$–$1.9\times$, far below the GPU
+price premium. NTAC accordingly runs on a CPU Studio via
+`launch_lightning_sweep.py --device cpu`, while LV keeps the GPU. The wrapper
+prints the distance kernel it actually selected, because NTAC reverts to CPU
+silently when the numba CUDA toolchain fails to link.
 
 ## Setup
 

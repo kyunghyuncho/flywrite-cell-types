@@ -5,6 +5,7 @@ description = "Variational stochastic block models for FlyWire neuron clustering
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "lightning-sdk>=2026.8.5",
     "matplotlib",
     "ntac>=0.1.2",
     "numpy",
@@ -25,3 +26,8 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
