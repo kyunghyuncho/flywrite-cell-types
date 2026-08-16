@@ -134,6 +134,61 @@ Orchestration: [`run_experiments.py`](run_experiments.py). Remote sweeps:
 [`launch_lightning_sweep.py`](launch_lightning_sweep.py). Inspection notebook:
 [`inspect_sweep_results.ipynb`](inspect_sweep_results.ipynb).
 
+### Full-brain sink protocol
+
+Steps 1–3 score a partition only on the $46\,479$ graph nodes carrying a visual
+type, which silently grants the method the visual / non-visual split — an
+annotation no unsupervised method receives — and says nothing about what it
+does with the remaining $87\,702$ neurons. `build_nonvisual_sink_gt`
+([`evaluate_clustering.py`](evaluate_clustering.py)) therefore extends the
+ground truth to all $134\,181$ graph nodes by giving every unlabelled node one
+shared sink label `__nonvisual__`. Nodes a predictor never scored are collected
+into a single reserved cluster rather than dropped, so fitting on a subgraph is
+not silently rewarded. [`reeval_nonvisual_sink.py`](reeval_nonvisual_sink.py)
+re-scores assignment dictionaries already on disk under both protocols; no
+model is retrained.
+
+```bash
+uv run python reeval_nonvisual_sink.py --pred reeval_artifacts/*_assignment_dict.npy
+```
+
+| partition | fitted on | sink Hungarian | fraction | sink ARI | sink NMI | visual fraction |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| single-cluster floor | — | $87\,702$ | $65.4\%$ | $0$ | $0$ | — |
+| split-only oracle | — | $90\,209$ | $67.2\%$ | $0.766$ | $0.434$ | $5.4\%$ |
+| LV-vSBM headline ($\lambda=1$) | full brain | $28\,936\pm66$ | $21.6\%$ | $0.005$ | $0.492$ | $59.5\%$ |
+| LV-vSBM ($\lambda=0$) | full brain | $28\,279\pm355$ | $21.1\%$ | $0.005$ | $0.471$ | $57.7\%$ |
+| PCA $+$ $k$-means | full brain | $2\,075$ | $1.5\%$ | $0.000$ | $0.104$ | $3.1\%$ |
+| unseeded NTAC | full brain | *not scored* | — | — | — | $66.0\%$ |
+| unseeded NTAC | visual subgraph | $122\,653\pm913$ | $91.4\%$ | $0.999$ | $0.929$ | $75.2\%$ |
+
+Three seeds per learned row; fractions are of the Hungarian maximum on the node
+set concerned.
+
+The headline configuration drops from $59.5\%$ on the visual-only protocol to
+$21.6\%$ here, *below* the trivial single-cluster floor of $65.4\%$. It covers
+the whole graph but re-uses its $729$ clusters for the non-visual brain, so its
+visual-only score was measuring type recovery **given** the split rather than
+recovery of cell-type structure from connectivity alone.
+
+The last row is not a competing number and the two NTAC rows are not
+comparable. That run was fitted on the visual subgraph
+(see [Visual-system subgraph protocol](#visual-system-subgraph-protocol-alternative-scope)),
+so $87\,702$ of its nodes are unscored and
+collapse into one reserved cluster that happens to align almost perfectly with
+the sink; roughly $65$ percentage points of its $91.4\%$ are that free
+alignment, which the split-only oracle row isolates. A visual-scope partition
+must not be ranked against full-brain methods under this protocol.
+
+**Known gap.** The full-brain unseeded NTAC baseline ($30\,654.5\pm24.7$ on the
+visual-only protocol, 2 seeds) has *no* sink score above, because its
+per-neuron assignment dictionaries no longer exist either locally or on any
+stopped Studio — only the aggregated metrics survive, and those cannot be
+re-scored. Producing that row requires re-running full-brain NTAC at $K=729$,
+which is not a cheap job, so it is deferred rather than estimated. Until it
+exists, the sink protocol compares LV-vSBM and PCA against the two reference
+partitions, not against NTAC.
+
 Baselines kept in-tree: PCA $+$ $k$-means
 ([`train_pca_baseline.py`](train_pca_baseline.py)) and unseeded NTAC
 ([`train_ntac.py`](train_ntac.py)).
@@ -217,6 +272,12 @@ evidence it relies on while leaving NTAC's equitable partitioning of the
 labelled vertex set intact. Whether the gap is intrinsic or an artefact of a
 $36$-point grid is not settled by these runs; both readings are consistent with
 the near-identical held-out AUC ($0.987$) across the grid's top configurations.
+
+Partitions produced under this scope cover only the $46\,479$ labelled vertices,
+so they cannot be entered into the
+[full-brain sink protocol](#full-brain-sink-protocol) as competitors: there,
+every unscored node collapses into a reserved cluster that aligns with the sink
+and inflates the score by roughly $65$ percentage points.
 
 ### Isolated vertices under NTAC
 

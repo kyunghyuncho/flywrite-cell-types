@@ -7,13 +7,21 @@ Uses the Hungarian algorithm on the confusion matrix (same protocol as
 from __future__ import annotations
 
 import argparse
+import json
 import pickle
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+#: Ground-truth label given to every graph node that carries no visual type.
+NONVISUAL_LABEL = "__nonvisual__"
+
+#: Cluster assigned to graph nodes a predictor never scored.
+UNASSIGNED_LABEL = "__unassigned__"
 
 
 def load_assignment_dict(path: Path) -> dict[Any, Any]:
@@ -28,6 +36,38 @@ def load_assignment_dict(path: Path) -> dict[Any, Any]:
 def load_ground_truth(path: Path) -> dict[Any, Any]:
     with path.open("rb") as f:
         return pickle.load(f)
+
+
+def load_graph_root_ids(path: Path) -> list[int]:
+    """Read the connectome node set from ``root_id_to_index_mapping.json``.
+
+    The mapping is serialised with string keys; the assignment dicts and the
+    type pickle both use integers, so the keys are coerced here once.
+    """
+    with path.open("r") as f:
+        mapping = json.load(f)
+    return [int(root_id) for root_id in mapping]
+
+
+def build_nonvisual_sink_gt(
+    visual_gt: dict[Any, Any],
+    graph_root_ids: Iterable[Any],
+    sink_label: str = NONVISUAL_LABEL,
+) -> dict[int, Any]:
+    """Extend the visual type dictionary to every node of the connectome.
+
+    The FlyWire type pickle labels only the visual system ($K=729$ types on
+    roughly $46\\,000$ of the $134\\,181$ graph nodes). Scoring on that subset
+    silently conditions on knowing which neurons are visual. Here every
+    remaining node receives a single additional label ``sink_label``, so a
+    partition is asked to recover the visual types *and* to keep the rest of
+    the brain out of them.
+
+    Visual root IDs absent from the graph are dropped: they cannot be predicted.
+    """
+    if sink_label in set(visual_gt.values()):
+        raise ValueError(f"Sink label {sink_label!r} collides with a real visual type.")
+    return {int(root_id): visual_gt.get(int(root_id), sink_label) for root_id in graph_root_ids}
 
 
 def encode_labels(
@@ -76,6 +116,72 @@ def evaluate_pair(pred: dict[Any, Any], gt: dict[Any, Any]) -> dict[str, float]:
         "hungarian": hungarian_score(gt_labels, pred_labels),
         "ari": float(adjusted_rand_score(gt_labels, pred_labels)),
         "nmi": float(normalized_mutual_info_score(gt_labels, pred_labels)),
+    }
+
+
+def align_full_graph(
+    pred: dict[Any, Any],
+    gt: dict[Any, Any],
+    missing_label: str = UNASSIGNED_LABEL,
+) -> tuple[np.ndarray, np.ndarray, list[Any]]:
+    """Align a prediction to *every* ground-truth node, not just the shared keys.
+
+    Predictors fitted on a subgraph (e.g. NTAC restricted to the visual
+    system) leave most of the brain unscored. Dropping those nodes would
+    reward the restriction, so they are collected into one reserved cluster
+    ``missing_label`` instead.
+    """
+    nodes = sorted(gt.keys())
+    if not nodes:
+        raise ValueError("Ground truth is empty.")
+    values = [pred.get(k, missing_label) for k in nodes]
+    if any(k in pred and v == missing_label for k, v in zip(nodes, values, strict=True)):
+        raise ValueError(f"Missing-node label {missing_label!r} collides with a predicted cluster.")
+    gt_labels, _ = encode_labels([gt[k] for k in nodes])
+    pred_labels, _ = encode_labels(values)
+    return gt_labels, pred_labels, nodes
+
+
+def evaluate_pair_full_graph(
+    pred: dict[Any, Any],
+    gt: dict[Any, Any],
+    missing_label: str = UNASSIGNED_LABEL,
+) -> dict[str, float]:
+    """Hungarian / ARI / NMI over all ground-truth nodes (see ``align_full_graph``)."""
+    gt_labels, pred_labels, nodes = align_full_graph(pred, gt, missing_label=missing_label)
+    n = len(nodes)
+    covered = sum(1 for k in nodes if k in pred)
+    hungarian = hungarian_score(gt_labels, pred_labels)
+    return {
+        "n_nodes": float(n),
+        "n_covered": float(covered),
+        "n_missing": float(n - covered),
+        "n_gt_clusters": float(len(np.unique(gt_labels))),
+        "n_pred_clusters": float(len(np.unique(pred_labels))),
+        "hungarian": hungarian,
+        "hungarian_fraction": hungarian / n,
+        "ari": float(adjusted_rand_score(gt_labels, pred_labels)),
+        "nmi": float(normalized_mutual_info_score(gt_labels, pred_labels)),
+    }
+
+
+def majority_class_baseline(gt: dict[Any, Any]) -> dict[str, float]:
+    """Score of the degenerate partition that puts every node in a single cluster.
+
+    On the sink-extended ground truth this is large — the sink class alone
+    holds most of the brain — and it is the floor against which any full-graph
+    Hungarian score must be read.
+    """
+    labels, counts = np.unique(np.array(list(gt.values()), dtype=object), return_counts=True)
+    n = int(counts.sum())
+    largest = int(counts.max())
+    return {
+        "n_nodes": float(n),
+        "n_gt_clusters": float(len(labels)),
+        "hungarian": float(largest),
+        "hungarian_fraction": largest / n,
+        "ari": 0.0,
+        "nmi": 0.0,
     }
 
 
