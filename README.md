@@ -154,6 +154,31 @@ The same files may instead be supplied explicitly with `--adjacency`,
 ablation, export with `--category "OL intrinsic"` and pass its
 `*_ol_intrinsic` adjacency and mapping explicitly.
 
+### LV hyperparameter grid on the visual subgraph
+
+The induced graph is a different optimisation problem from the full brain, so
+the full-brain optimum is not transferable and the visual scope is searched on
+its own $36$-point grid: $d\in\{256,512\}$, learning rate
+$\in\{0.01,0.03\}$, entropy weight $\beta_H\in\{0.1,0.3,1.0\}$ and
+partner-histogram KL weight $\lambda\in\{0,0.3,1\}$, with `bfs_frac=1`, a
+Bernoulli likelihood and unit-norm cluster embeddings at fixed scale $16$ held
+fixed. Selection uses held-out edge AUC at $40$ epochs — the same budget as the
+finals, since a shorter search ranks configurations by their transient early
+behaviour rather than by where they converge:
+
+```bash
+uv run python launch_lightning_sweep.py \
+  --studio-name flywrite-visual-lv-hp --machine T4 \
+  --graph-scope visual --methods lv --phase all \
+  --lv-dims 256 512 --lv-lrs 0.01 0.03 --lv-bfs-fracs 1.0 \
+  --lv-likelihoods bernoulli \
+  --lv-u-norms unit --lv-u-scales fixed --lv-u-scale-inits 16.0 \
+  --lv-entropy-betas 0.1 0.3 1.0 --lv-partner-kl-weights 0 0.3 1.0 \
+  --select-metric auc --grad-clip 1.0 \
+  --epochs 40 --final-epochs 40 --final-seeds 0 1 2 \
+  --detach-only --remote-stop-after
+```
+
 ### Isolated vertices under NTAC
 
 Inducing on visual neurons deletes every cross-region edge, which strands $24$
