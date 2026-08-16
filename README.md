@@ -180,14 +180,26 @@ the sink; roughly $65$ percentage points of its $91.4\%$ are that free
 alignment, which the split-only oracle row isolates. A visual-scope partition
 must not be ranked against full-brain methods under this protocol.
 
-**Known gap.** The full-brain unseeded NTAC baseline ($30\,654.5\pm24.7$ on the
-visual-only protocol, 2 seeds) has *no* sink score above, because its
-per-neuron assignment dictionaries no longer exist either locally or on any
-stopped Studio — only the aggregated metrics survive, and those cannot be
-re-scored. Producing that row requires re-running full-brain NTAC at $K=729$,
-which is not a cheap job, so it is deferred rather than estimated. Until it
-exists, the sink protocol compares LV-vSBM and PCA against the two reference
-partitions, not against NTAC.
+**Refresh in progress.** The historical full-brain unseeded NTAC baseline
+($30\,654.5\pm24.7$ on the visual-only protocol, 2 seeds) left no per-neuron
+assignment dictionaries, so it could not be re-scored under the sink
+protocol. A fresh full-brain run at $K=729$, $R=12$, $T=0.1$ on
+`CPU_X_16` (studio `flywrite-full-ntac`; three final seeds) is regenerating
+those assignments for sink evaluation via
+[`reeval_nonvisual_sink.py`](reeval_nonvisual_sink.py). Until that finishes,
+the sink table above still omits a comparable full-brain NTAC row.
+
+```bash
+# launch (CPU; GPU is not cost-effective for unseeded NTAC)
+uv run python launch_lightning_sweep.py \
+  --studio-name flywrite-full-ntac --machine CPU_X_16 --device cpu \
+  --graph-scope full --methods ntac --phase all \
+  --ntac-max-ks 729 --ntac-max-iters 12 --ntac-frac-seeds 0.1 \
+  --final-seeds 0 1 2 --detach-only --remote-stop-after
+
+# after download of *_assignment_dict.npy:
+uv run python reeval_nonvisual_sink.py --pred reeval_artifacts/final_ntac_*_assignment_dict.npy
+```
 
 Baselines kept in-tree: PCA $+$ $k$-means
 ([`train_pca_baseline.py`](train_pca_baseline.py)) and unseeded NTAC
