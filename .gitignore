@@ -29,6 +29,8 @@ ntac_hp_results.json
 # Entropy-β ablation outputs (STATUS.txt, poller logs, per-run metrics); not source.
 entropy_beta_results/
 partner_kl_results/
+# Assignment dicts pulled from stopped Studios plus the sink re-scoring summary.
+reeval_artifacts/
 heldout_pairs.npz
 heldout_rows.npz
 *_metrics.json

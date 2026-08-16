@@ -134,6 +134,24 @@ Orchestration: [`run_experiments.py`](run_experiments.py). Remote sweeps:
 [`launch_lightning_sweep.py`](launch_lightning_sweep.py). Inspection notebook:
 [`inspect_sweep_results.ipynb`](inspect_sweep_results.ipynb).
 
+**Full-brain sink protocol.** Steps 1–3 score a partition only on the
+$46\,479$ graph nodes carrying a visual type, which silently grants the method
+the visual / non-visual split. `build_nonvisual_sink_gt`
+([`evaluate_clustering.py`](evaluate_clustering.py)) instead extends the ground
+truth to all $134\,181$ nodes by giving every unlabelled node one shared sink
+label `__nonvisual__`, and [`reeval_nonvisual_sink.py`](reeval_nonvisual_sink.py)
+re-scores existing assignment dictionaries under both protocols without
+retraining. The relevant references are the degenerate single-cluster floor
+($87\,702$, $65.4\%$) and a split-only oracle that knows nothing but which
+neurons are visual ($90\,209$, $67.2\%$). Against these, the headline
+LV-vSBM configuration reaches $28\,936\pm66$ ($21.6\%$, ARI $0.005$): covering
+all $134\,181$ nodes with the same $729$ clusters it uses for visual types
+costs it far more than the visual-only table shows. A partition fitted on the
+visual subgraph alone scores $122\,653\pm913$ ($91.4\%$, ARI $0.999$), but
+$87\,702$ of those nodes are ones it never scored and that collapse into a
+single reserved cluster aligned with the sink, so the two numbers measure
+different things and must not be read as a ranking.
+
 Baselines kept in-tree: PCA $+$ $k$-means
 ([`train_pca_baseline.py`](train_pca_baseline.py)) and unseeded NTAC
 ([`train_ntac.py`](train_ntac.py)).
