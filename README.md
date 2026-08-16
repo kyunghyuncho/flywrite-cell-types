@@ -15,6 +15,13 @@ FlyWire, and how it compares to the connectivity-only baseline NTAC
 
 ## Results
 
+The main setting is the **full brain**: every method is fitted on the complete
+$n=134\,181$ connectome and scored on the labelled subset. A narrower
+visual-system scope is available as an alternative protocol and is reported
+separately in [Visual-system subgraph protocol](#visual-system-subgraph-protocol-alternative-scope);
+the two scopes are different fitting problems and their numbers are not
+interchangeable.
+
 Agreement with the $729$ FlyWire visual types on the labelled subset.
 Hyperparameters are chosen by held-out edge AUC; Hungarian / ARI / NMI /
 $K_{\mathrm{pred}}$ are diagnostics. The theoretical maximum Hungarian score
@@ -131,12 +138,22 @@ Baselines kept in-tree: PCA $+$ $k$-means
 ([`train_pca_baseline.py`](train_pca_baseline.py)) and unseeded NTAC
 ([`train_ntac.py`](train_ntac.py)).
 
-## Visual-system subgraph protocol
+## Visual-system subgraph protocol (alternative scope)
 
-Protocol (1) fits both NTAC and LV-vSBM on the induced subgraph of neurons with
-FlyWire visual-type annotations. This matches the NTAC paper's visual-system
-setting more closely than fitting the full-brain graph and restricting only the
-reported assignments. Export the graph once, then select it by scope:
+This section describes an **optional alternative** to the full-brain setting
+above, not a replacement for it. Here both NTAC and LV-vSBM are fitted on the
+induced subgraph of the $46\,479$ neurons carrying a FlyWire visual-type
+annotation, so that training scope and evaluation scope coincide. Its purpose
+is a like-for-like comparison against the NTAC paper, which works in the
+visual system: on the full brain a method must also spend capacity on the
+$87\,702$ unlabelled neurons, and one may reasonably object that this
+handicaps it relative to the published setting. The subgraph protocol removes
+that objection at the cost of conditioning the whole experiment on the
+visual / non-visual split — information no unsupervised method is otherwise
+given. For that reason the full brain remains the primary scientific setting
+and these numbers are read alongside, not against, the table above.
+
+Export the graph once, then select it by scope:
 
 ```bash
 uv run python export_visual_subgraph.py \
@@ -178,6 +195,28 @@ uv run python launch_lightning_sweep.py \
   --epochs 40 --final-epochs 40 --final-seeds 0 1 2 \
   --detach-only --remote-stop-after
 ```
+
+### Results under the alternative scope
+
+Both methods are fitted and scored on the same $46\,479$ vertices, three seeds
+each, with the LV configuration selected by the grid above ($d=256$, learning
+rate $0.03$, $\beta_H=0.3$, $\lambda=1$).
+
+| method (visual scope) | Hungarian | fraction | ARI | NMI |
+| --- | ---: | ---: | ---: | ---: |
+| Unseeded NTAC | $\mathbf{34\,951 \pm 913}$ | $\mathbf{75.2\%}$ | $0.754$ | $0.902$ |
+| LV-vSBM | $15\,182 \pm 194$ | $32.7\%$ | $0.255$ | $0.819$ |
+
+Restricting the graph moves the two methods in opposite directions. NTAC
+improves on its full-brain score ($30\,654$ to $34\,951$), whereas LV-vSBM
+falls well below its own ($27\,644$ to $15\,182$) even after its
+hyperparameters are re-searched on this scope. Inducing on visual neurons
+deletes every edge to the rest of the brain, and LV-vSBM estimates block
+structure from exactly those connectivity profiles, so the truncation removes
+evidence it relies on while leaving NTAC's equitable partitioning of the
+labelled vertex set intact. Whether the gap is intrinsic or an artefact of a
+$36$-point grid is not settled by these runs; both readings are consistent with
+the near-identical held-out AUC ($0.987$) across the grid's top configurations.
 
 ### Isolated vertices under NTAC
 

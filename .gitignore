@@ -37,8 +37,14 @@ heldout_rows.npz
 root_id_to_index_mapping.json
 root_id_to_index_mapping_visual.json
 root_id_to_index_mapping_ol_intrinsic.json
+root_id_to_index_mapping_paper_*.json
 visual_subgraph_meta*.json
+paper_*_meta.json
 heldout_*visual*
+# Downloaded finals of the visual-scope LV hyperparameter search; the selected
+# numbers are transcribed into README.md rather than tracked.
+lv_visual_hp_results/
+*.bak.py
 uv.lock
 lightning_unsup_sweep.log
 *.log
