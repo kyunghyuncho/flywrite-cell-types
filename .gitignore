@@ -31,6 +31,10 @@ entropy_beta_results/
 partner_kl_results/
 # Assignment dicts pulled from stopped Studios plus the sink re-scoring summary.
 reeval_artifacts/
+# Full-brain unseeded NTAC artefacts (assignment dicts, per-run metrics, sink
+# summary); the selected numbers are transcribed into README.md rather than
+# tracked. Named explicitly because "*sweep*results*/" does not match it.
+full_ntac_results/
 heldout_pairs.npz
 heldout_rows.npz
 *_metrics.json
