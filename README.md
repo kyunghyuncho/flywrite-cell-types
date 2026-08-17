@@ -159,11 +159,12 @@ uv run python reeval_nonvisual_sink.py --pred reeval_artifacts/*_assignment_dict
 | LV-vSBM headline ($\lambda=1$) | full brain | $28\,936\pm66$ | $21.6\%$ | $0.005$ | $0.492$ | $59.5\%$ |
 | LV-vSBM ($\lambda=0$) | full brain | $28\,279\pm355$ | $21.1\%$ | $0.005$ | $0.471$ | $57.7\%$ |
 | PCA $+$ $k$-means | full brain | $2\,075$ | $1.5\%$ | $0.000$ | $0.104$ | $3.1\%$ |
-| unseeded NTAC | full brain | *not scored* | — | — | — | $66.0\%$ |
+| **unseeded NTAC (HP stage, seed $0$)** | full brain | $\mathbf{38\,579}$ | $\mathbf{28.8\%}$ | $0.023$ | $0.460$ | $65.2\%$ |
 | unseeded NTAC | visual subgraph | $122\,653\pm913$ | $91.4\%$ | $0.999$ | $0.929$ | $75.2\%$ |
 
-Three seeds per learned row; fractions are of the Hungarian maximum on the node
-set concerned.
+Fractions are of the Hungarian maximum on the node set concerned. The LV-vSBM
+and visual-subgraph NTAC rows average three seeds; the full-brain NTAC row is a
+single run, for the reasons given below.
 
 The headline configuration drops from $59.5\%$ on the visual-only protocol to
 $21.6\%$ here, *below* the trivial single-cluster floor of $65.4\%$. It covers
@@ -180,26 +181,41 @@ the sink; roughly $65$ percentage points of its $91.4\%$ are that free
 alignment, which the split-only oracle row isolates. A visual-scope partition
 must not be ranked against full-brain methods under this protocol.
 
-**Refresh in progress.** The historical full-brain unseeded NTAC baseline
-($30\,654.5\pm24.7$ on the visual-only protocol, 2 seeds) left no per-neuron
-assignment dictionaries, so it could not be re-scored under the sink
-protocol. A fresh full-brain run at $K=729$, $R=12$, $T=0.1$ on
-`CPU_X_16` (studio `flywrite-full-ntac`; three final seeds) is regenerating
-those assignments for sink evaluation via
-[`reeval_nonvisual_sink.py`](reeval_nonvisual_sink.py). Until that finishes,
-the sink table above still omits a comparable full-brain NTAC row.
+**Provenance of the full-brain NTAC row.** The historical full-brain unseeded
+NTAC baseline ($30\,654.5\pm24.7$ on the visual-only protocol, two seeds) left
+no per-neuron assignment dictionaries and therefore could not be re-scored under
+the sink protocol. A fresh full-brain run at $K=729$, $R=12$, $T=0.1$ on
+`CPU_X_16` (studio `flywrite-full-ntac`; unseeded NTAC does not repay a GPU, see
+[Device selection](#device-selection)) supplied the missing assignments. Only
+the hyperparameter stage was retained: multi-seed finals were **not** run, since
+a single equitable partition of the whole graph already answers the question the
+sink protocol asks, and the historical seed-to-seed spread
+($\pm24.7$ on $30\,654.5$, i.e. $\approx0.08\%$) is two orders of magnitude
+below the effects at issue. That the single run reproduces the historical
+visual-only score to within $1.2\%$ ($30\,282$ against $30\,654.5$ at identical
+$K$, $R$ and $T$) is consistent with the row being representative rather than a
+seed artefact, though with $n=1$ this cannot be asserted with a confidence
+interval.
 
 ```bash
-# launch (CPU; GPU is not cost-effective for unseeded NTAC)
-uv run python launch_lightning_sweep.py \
-  --studio-name flywrite-full-ntac --machine CPU_X_16 --device cpu \
-  --graph-scope full --methods ntac --phase all \
-  --ntac-max-ks 729 --ntac-max-iters 12 --ntac-frac-seeds 0.1 \
-  --final-seeds 0 1 2 --detach-only --remote-stop-after
-
-# after download of *_assignment_dict.npy:
-uv run python reeval_nonvisual_sink.py --pred reeval_artifacts/final_ntac_*_assignment_dict.npy
+# re-score the retained assignment dictionary under both protocols
+uv run python reeval_nonvisual_sink.py \
+  --pred full_ntac_results/hp_ntac_k729_R12_T0.1_assignment_dict.npy
 ```
+
+**Interpretation.** NTAC leads LV-vSBM under both protocols — $28.8\%$ against
+$21.6\%$ on the sink, $65.2\%$ against $59.5\%$ on the visual-only subset — so
+the ranking established in [Results](#results) survives the change of scoring
+scope. What does not survive is the standing of either method against the
+trivial baseline: at $28.8\%$, NTAC also falls far below the $65.4\%$
+single-cluster floor. Its $396$ recovered clusters are distributed over the
+whole brain rather than concentrated on the visual system, so the sink is
+fragmented much as LV's is, and a sink ARI of $0.023$ against the split-only
+oracle's $0.766$ indicates that essentially none of the visual / non-visual
+boundary is recovered. The reading given above for LV-vSBM thus extends to
+NTAC: a visual-only score of $65.2\%$ quantifies type recovery **conditional on**
+the visual / non-visual split, not recovery of cell-type structure from
+connectivity alone.
 
 Baselines kept in-tree: PCA $+$ $k$-means
 ([`train_pca_baseline.py`](train_pca_baseline.py)) and unseeded NTAC
